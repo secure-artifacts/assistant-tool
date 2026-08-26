@@ -1,0 +1,40 @@
+# Local runtime configuration and API keys
+/config.json
+
+# Legacy per-machine schema file (migrated into config.json)
+/TaskTableSchema.json
+
+# Google OAuth credentials and renewable tokens
+/GoogleDriveCredentials.json
+/GoogleDriveToken.json
+/GoogleSheetsCredentials.json
+/GoogleSheetsToken.json
+
+# Private operational records and personal data
+/TaskSubmissionLog.jsonl
+/GoogleSheetMonitorState.json
+/InventoryState.json
+/TaskReferenceDownloadState.json
+/人脸数据库/
+
+# Legacy layout from versions before the task-result integration refactor
+/model/task_result_organizer/
+
+# Generated files, local backups and archives
+__pycache__/
+*.py[cod]
+*.bak-*
+*.7z
+*.tmp
+
+# Editor and operating-system noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local and CI build output
+/build/
+/dist/
+/dist_final/
+/*.spec

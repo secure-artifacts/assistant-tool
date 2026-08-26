@@ -1,0 +1,29 @@
+{
+  "task_path": "",
+  "video_sorting_station_path": "",
+  "video_image_root_path": "",
+  "elevenlabs_api_keys": [],
+  "gemini_api_keys": [],
+  "run_upload": false,
+  "enable_video_review_detection": false,
+  "video_detection_mode": "manual",
+  "video_detection_target_name": "目标元素",
+  "video_detection_target_description": "",
+  "video_detection_rules": [],
+  "video_detection_positive_keywords": [],
+  "video_detection_negative_keywords": [],
+  "video_detection_ambiguous_keywords": [],
+  "video_detection_report_name": "视频检测报告.json",
+  "review_sheet_enabled": false,
+  "review_sheet_url": "",
+  "task_submission_sheet_enabled": false,
+  "task_submission_sheet_url": "",
+  "drive_parent_folder_id": "",
+  "google_sheet_monitor": {
+    "enabled": false,
+    "spreadsheets": [],
+    "poll_seconds": 60,
+    "download_folder": "谷歌表格下载"
+  },
+  "chrome_websites": []
+}
