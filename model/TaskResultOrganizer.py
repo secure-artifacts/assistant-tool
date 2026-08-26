@@ -1,0 +1,662 @@
+import json
+import os
+import re
+import threading
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+from PyQt5 import QtCore
+
+from app_paths import APP_ROOT
+from model.GoogleDriveHelper import (
+    load_drive_service,
+    print_person_folder_links,
+    read_drive_parent_folder_id,
+    upload_local_dirs_to_drive_batch,
+    upload_routed_changed_files_to_drive_batch,
+)
+from model.GoogleSheetsHelper import write_review_video_links
+from model.OdsHelper import normalize_subcategory_path
+from model.TaskResultExporter import export_one_date
+from model.TaskSubmissionHelper import write_task_submission_links
+from model.VideoCompressor import compress_video
+from model import VideoElementDetector as video_element_detector
+from model.VideoElementDetector import (
+    detect_video_element,
+    is_positive_detection,
+    summarize_detection,
+)
+
+
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+LEGACY_TASK_RESULT_CONFIG = APP_ROOT / "model" / "task_result_organizer" / "defaults.json"
+
+TASK_RESULT_DEFAULTS = {
+    "run_export": True,
+    "run_upload": True,
+    "open_result_dir": True,
+    "wsp_export": False,
+    "upload_only_changed_files": True,
+    "enable_video_review_detection": True,
+    "video_detection_mode": "ask",
+    "review_min_confidence": 0.4,
+    "detection_failure_goes_to_review": True,
+    "review_folder_name": "review",
+    "compress_enabled": True,
+    "compress_name_keywords": [],
+    "gemini_api_keys": [],
+    "gemini_model": "gemini-2.5-flash-lite",
+    "drive_parent_folder_id": "",
+    "upload_date_override": "",
+    "upload_slot_override": "",
+    "review_sheet_enabled": True,
+    "task_submission_sheet_enabled": True,
+}
+
+MIGRATED_FILE_NAMES = {
+    "review_sheet_credentials_file": "GoogleSheetsCredentials.json",
+    "review_sheet_token_file": "GoogleSheetsToken.json",
+    "task_submission_sheet_credentials_file": "GoogleSheetsCredentials.json",
+    "task_submission_sheet_token_file": "GoogleSheetsToken.json",
+    "task_submission_log_file": "TaskSubmissionLog.jsonl",
+}
+
+
+def config_bool(config: Dict[str, Any], name: str, default: bool) -> bool:
+    value = config.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "是"}
+    return bool(value)
+
+
+def config_str(config: Dict[str, Any], name: str, default: str = "") -> str:
+    value = config.get(name, default)
+    return str(value).strip() if value is not None else default
+
+
+def config_list(config: Dict[str, Any], name: str) -> List[str]:
+    value = config.get(name) or []
+    if isinstance(value, str):
+        return [part for part in re.split(r"[\s,，;；]+", value) if part]
+    if isinstance(value, Iterable):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def load_effective_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = dict(TASK_RESULT_DEFAULTS)
+    if isinstance(overrides, dict):
+        config.update(overrides)
+    return config
+
+
+def migrate_legacy_task_result_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """One-time migration from the old copied subproject into the main config."""
+    target = Path(config_path or APP_ROOT / "config.json")
+    if not target.is_absolute():
+        target = APP_ROOT / target
+
+    config = {}
+    if target.exists():
+        config = json.loads(target.read_text(encoding="utf-8-sig"))
+        if not isinstance(config, dict):
+            raise ValueError(f"主配置必须是 JSON 对象：{target}")
+
+    if not LEGACY_TASK_RESULT_CONFIG.exists():
+        return config
+
+    legacy = json.loads(LEGACY_TASK_RESULT_CONFIG.read_text(encoding="utf-8-sig"))
+    if not isinstance(legacy, dict):
+        raise ValueError(f"旧整理配置必须是 JSON 对象：{LEGACY_TASK_RESULT_CONFIG}")
+
+    changed = False
+    for key, value in legacy.items():
+        value = MIGRATED_FILE_NAMES.get(key, value)
+        if key not in config:
+            config[key] = value
+            changed = True
+
+    for key, value in MIGRATED_FILE_NAMES.items():
+        if key in config and config[key] != value:
+            config[key] = value
+            changed = True
+
+    if changed:
+        temporary = target.with_name(f"{target.name}.task-result-migration.tmp")
+        temporary.write_text(
+            json.dumps(config, ensure_ascii=False, indent=4),
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+    return config
+
+
+def parse_task_date(text: str) -> date:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        raise ValueError("日期不能为空")
+
+    lowered = raw_text.lower()
+    if lowered in {"today", "今天"}:
+        return date.today()
+    if lowered in {"yesterday", "昨天"}:
+        return date.today() - timedelta(days=1)
+
+    numbers = [int(part) for part in re.findall(r"\d+", raw_text)]
+    if len(numbers) == 1 and len(raw_text) == 4:
+        return date(date.today().year, int(raw_text[:2]), int(raw_text[2:]))
+    if len(numbers) == 2:
+        return date(date.today().year, numbers[0], numbers[1])
+    if len(numbers) == 3:
+        return date(numbers[0], numbers[1], numbers[2])
+    raise ValueError(f"无法识别日期：{text}")
+
+
+def get_upload_batch(config: Dict, now: Optional[datetime] = None) -> Tuple[date, str]:
+    override_date = config_str(config, "upload_date_override")
+    override_slot = config_str(config, "upload_slot_override")
+    if override_date or override_slot:
+        if not override_date or not override_slot:
+            raise ValueError("指定上传批次时，日期和批次必须同时填写")
+        if override_slot not in {"01", "02", "03"}:
+            raise ValueError("上传批次只能是 01、02 或 03")
+        return parse_task_date(override_date), override_slot
+
+    current = now or datetime.now()
+    if current.hour < 7:
+        return current.date() - timedelta(days=1), "03"
+    if current.hour < 12:
+        return current.date(), "01"
+    if current.hour < 18:
+        return current.date(), "02"
+    return current.date(), "03"
+
+
+def is_video_file(file_path: Path) -> bool:
+    return Path(file_path).suffix.lower() in VIDEO_SUFFIXES
+
+
+def is_compressed_video(file_path: Path) -> bool:
+    return Path(file_path).name.startswith("[SHANA]")
+
+
+def file_identity(file_path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(Path(file_path))))
+
+
+def task_for_file(task_by_file: Optional[Dict[str, Any]], file_path: Path):
+    if not task_by_file:
+        return None
+    return task_by_file.get(file_identity(file_path))
+
+
+def review_override_for_file(
+    task_by_file: Optional[Dict[str, Any]],
+    file_path: Path,
+) -> Optional[bool]:
+    task = task_for_file(task_by_file, file_path)
+    value = getattr(task, "review_required", None) if task is not None else None
+    return value if isinstance(value, bool) else None
+
+
+def subcategory_path_for_file(
+    task_by_file: Optional[Dict[str, Any]],
+    file_path: Path,
+) -> Path:
+    task = task_for_file(task_by_file, file_path)
+    if task is None:
+        return Path(".")
+    normalized = normalize_subcategory_path(getattr(task, "subcategory", ""))
+    if not normalized:
+        return Path(".")
+    return Path(*normalized.split("/"))
+
+
+def updated_files_from_batches(
+    changed_file_batches: Iterable[Tuple[Path, Iterable[Path]]],
+) -> List[Path]:
+    """Return each updated file once while preserving the export order."""
+    updated_files = []
+    seen = set()
+    for _root_dir, files in changed_file_batches:
+        for file_path in files:
+            path = Path(file_path)
+            key = os.path.normcase(os.path.abspath(str(path)))
+            if key in seen:
+                continue
+            seen.add(key)
+            updated_files.append(path)
+    return updated_files
+
+
+def resolve_ask_detection_mode(
+    config: Dict,
+    changed_file_batches: Iterable[Tuple[Path, Iterable[Path]]],
+    resolver: Optional[Callable[[List[Path]], str]] = None,
+    task_by_file: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve the interactive video-review choice after export has finished."""
+    detection_mode = config_str(config, "video_detection_mode", "ai").lower()
+    if (
+        detection_mode != "ask"
+        or not config_bool(config, "enable_video_review_detection", True)
+    ):
+        return detection_mode
+
+    updated_files = updated_files_from_batches(changed_file_batches)
+    has_detectable_video = any(
+        is_video_file(file_path)
+        and not is_compressed_video(file_path)
+        and review_override_for_file(task_by_file, file_path) is not False
+        for file_path in updated_files
+    )
+    if not has_detectable_video:
+        return detection_mode
+
+    selected_mode = "ai" if resolver is None else str(resolver(updated_files) or "")
+    selected_mode = selected_mode.strip().lower()
+    if selected_mode not in {"ai", "skip", "manual"}:
+        raise ValueError(f"不支持的视频检测方式：{selected_mode or '空'}")
+    config["video_detection_mode"] = selected_mode
+    return selected_mode
+
+
+def get_upload_person_name(file_path: Path, root_dir: Path, creator_marker: str) -> Optional[str]:
+    file_path = Path(file_path)
+    root_dir = Path(root_dir)
+    try:
+        relative_path = file_path.relative_to(root_dir)
+    except ValueError:
+        relative_path = Path(file_path.name)
+
+    name = relative_path.parts[0] if len(relative_path.parts) > 1 else relative_path.name
+    if name.startswith("[SHANA]"):
+        name = name[len("[SHANA]") :]
+
+    match = re.match(
+        rf"^(?P<person>.+?){re.escape(creator_marker)}-\d{{4}}-",
+        name,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group("person").strip().strip(". ") or None
+
+
+def build_routed_batches(
+    changed_file_batches: Iterable[Tuple[Path, Iterable[Path]]],
+    config: Dict,
+    task_by_file: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[Path, List[Path], Path]]:
+    routed = []
+    api_keys = None
+    detection_enabled = config_bool(config, "enable_video_review_detection", True)
+    detection_mode = config_str(config, "video_detection_mode", "ai").lower()
+    if detection_mode == "ask":
+        # The main window resolves "ask" before starting the worker. This fallback
+        # keeps programmatic callers deterministic.
+        detection_mode = "ai"
+    review_folder_name = config_str(config, "review_folder_name", "review") or "review"
+    min_confidence = float(config.get("review_min_confidence", 0.4) or 0.4)
+    failure_goes_to_review = config_bool(config, "detection_failure_goes_to_review", True)
+    creator_marker = config_str(config, "video_filename_creator_marker")
+    if not creator_marker:
+        raise ValueError("未配置 video_filename_creator_marker，无法按文件名分流")
+
+    for root_dir, changed_files in changed_file_batches:
+        root_dir = Path(root_dir)
+        normal_files = []
+        review_files = []
+
+        for file_path in changed_files:
+            file_path = Path(file_path)
+            review_override = review_override_for_file(task_by_file, file_path)
+            is_detectable_video = (
+                is_video_file(file_path) and not is_compressed_video(file_path)
+            )
+            if is_detectable_video and review_override is False:
+                normal_files.append(file_path)
+                print(f"本地任务设置为无需审核，已跳过检测：{file_path.name}")
+                continue
+
+            effective_mode = detection_mode
+            if is_detectable_video and review_override is True:
+                if not detection_enabled or detection_mode == "skip":
+                    effective_mode = "manual"
+                    print(f"本地任务强制审核，已改为人工审核：{file_path.name}")
+                else:
+                    print(f"本地任务要求审核，按本轮方式处理：{file_path.name}")
+
+            should_detect = is_detectable_video and (
+                review_override is True
+                or (detection_enabled and effective_mode != "skip")
+            )
+            if should_detect:
+                print(f"\n开始检测视频元素：{file_path.name}")
+                try:
+                    if effective_mode == "ai" and api_keys is None:
+                        configured_keys = config_list(config, "gemini_api_keys")
+                        if not configured_keys:
+                            raise RuntimeError("没有可用的 Gemini API Key，请在程序设置中添加")
+                        api_keys = video_element_detector.read_gemini_api_keys(configured_keys)
+                    result = detect_video_element(
+                        file_path,
+                        api_keys=api_keys,
+                        detection_mode=effective_mode,
+                    )
+                    print(f"检测结果：{summarize_detection(result)}")
+                    if result.get("skip_upload"):
+                        print(f"人工审核标记为视频有问题，本轮不上传：{file_path.name}")
+                        continue
+                    if is_positive_detection(result, min_confidence):
+                        review_files.append(file_path)
+                        print(f"进入人工检查队列：{file_path.name}")
+                    else:
+                        normal_files.append(file_path)
+                except BaseException as error:
+                    print(f"视频检测失败：{file_path.name} -> {type(error).__name__}: {error}")
+                    if failure_goes_to_review:
+                        review_files.append(file_path)
+                        print(f"检测失败，按保守策略进入人工检查队列：{file_path.name}")
+                    else:
+                        normal_files.append(file_path)
+            else:
+                normal_files.append(file_path)
+
+        normal_file_groups = {}
+        for normal_file in normal_files:
+            person_name = get_upload_person_name(normal_file, root_dir, creator_marker)
+            remote_prefix = Path(person_name) if person_name else Path(".")
+            subcategory_path = subcategory_path_for_file(task_by_file, normal_file)
+            if person_name and str(subcategory_path) not in {"", "."}:
+                remote_prefix = remote_prefix / subcategory_path
+            normal_file_groups.setdefault(remote_prefix, []).append(normal_file)
+
+        for remote_prefix, grouped_files in normal_file_groups.items():
+            routed.append((root_dir, grouped_files, remote_prefix))
+        if review_files:
+            routed.append((root_dir, review_files, Path(review_folder_name)))
+    return routed
+
+
+def compress_routed_batches(
+    routed_batches: List[Tuple[Path, List[Path], Path]],
+    config: Dict,
+    task_by_file: Optional[Dict[str, Any]] = None,
+    upload_task_by_file: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[Path, List[Path], Path]]:
+    compressed_batches = []
+    for root_dir, file_list, remote_prefix in routed_batches:
+        upload_files = []
+        for file_path in file_list:
+            source_path = Path(file_path)
+            upload_path = (
+                compress_video(source_path, config)
+                if is_video_file(source_path)
+                else source_path
+            )
+            upload_files.append(upload_path)
+            task = task_for_file(task_by_file, source_path)
+            if task is not None and upload_task_by_file is not None:
+                upload_task_by_file[file_identity(upload_path)] = task
+        if upload_files:
+            compressed_batches.append((root_dir, upload_files, remote_prefix))
+    return compressed_batches
+
+
+def attach_local_task_metadata(
+    uploaded_records: Iterable[Dict],
+    upload_task_by_file: Optional[Dict[str, Any]],
+) -> None:
+    for record in uploaded_records:
+        local_file = record.get("local_file")
+        if not local_file:
+            continue
+        task = task_for_file(upload_task_by_file, Path(str(local_file)))
+        if task is None:
+            continue
+        if bool(getattr(task, "task_type_from_table", False)):
+            record["task_type_override"] = str(getattr(task, "task_type", "") or "").strip()
+        review_required = getattr(task, "review_required", None)
+        if isinstance(review_required, bool):
+            record["review_required_override"] = review_required
+        source_row = getattr(task, "source_row", None)
+        if source_row is not None:
+            record["local_task_row"] = source_row
+
+
+def is_review_upload_record(record: Dict, review_folder_name: str) -> bool:
+    review_key = str(review_folder_name or "review").strip().casefold()
+    for field_name in ("remote_prefix", "relative_path"):
+        parts = [
+            part
+            for part in re.split(r"[\\/]+", str(record.get(field_name) or ""))
+            if part
+        ]
+        if parts:
+            return parts[0].casefold() == review_key
+    return False
+
+
+def run_task_result_organizer(
+    task_dates: Iterable[date],
+    base_dir: Path,
+    config: Optional[Dict] = None,
+    detection_mode_resolver: Optional[Callable[[List[Path]], str]] = None,
+) -> Dict:
+    config = load_effective_config(config)
+    video_element_detector.set_runtime_config(config)
+    base_dir = Path(base_dir)
+    task_dates = list(task_dates)
+    if not task_dates:
+        raise ValueError("没有要整理的任务日期")
+    if not base_dir.is_dir():
+        raise ValueError(f"任务路径不是一个目录：{base_dir}")
+
+    run_export = config_bool(config, "run_export", True)
+    run_upload = config_bool(config, "run_upload", True)
+    only_changed = config_bool(config, "upload_only_changed_files", True)
+    wsp_export = config_bool(config, "wsp_export", False)
+    review_folder_name = config_str(config, "review_folder_name", "review") or "review"
+    result_dirs = []
+    changed_file_batches = []
+    task_by_file = {}
+
+    def remember_exported_task(file_path, task):
+        task_by_file[file_identity(file_path)] = task
+
+    if run_export:
+        for task_date in task_dates:
+            result = export_one_date(
+                task_date,
+                base_dir=base_dir,
+                wsp_export=wsp_export,
+                config=config,
+                exported_file_callback=remember_exported_task,
+            )
+            if result:
+                result_dirs.append(result.output_dir)
+                if result.updated_files:
+                    changed_file_batches.append((result.output_dir, result.updated_files))
+    else:
+        result_dirs = [base_dir / f"{item.month:02d}{item.day:02d}" / "result" for item in task_dates]
+
+    summary = {
+        "result_dirs": [str(path) for path in result_dirs],
+        "changed_file_count": sum(len(files) for _, files in changed_file_batches),
+        "uploaded_file_count": 0,
+        "message": "整理完成",
+    }
+    if not run_upload:
+        summary["message"] = "整理完成，设置中已关闭上传。"
+        return summary
+
+    if only_changed and not changed_file_batches:
+        summary["message"] = "没有本次新增或更新的文件，已跳过 Google Drive 上传。"
+        return summary
+
+    if only_changed:
+        resolve_ask_detection_mode(
+            config,
+            changed_file_batches,
+            resolver=detection_mode_resolver,
+            task_by_file=task_by_file,
+        )
+
+    configured_parent = config_str(config, "drive_parent_folder_id")
+    if not configured_parent:
+        raise ValueError("Google Drive 父目录不能为空，请在程序设置中填写")
+    parent_folder_id = read_drive_parent_folder_id(configured_parent)
+    service = load_drive_service()
+    batch_date, batch_slot = get_upload_batch(config)
+    summary["upload_batch"] = f"{batch_date:%m%d}/{batch_slot}"
+
+    if only_changed:
+        routed_batches = build_routed_batches(
+            changed_file_batches,
+            config,
+            task_by_file=task_by_file,
+        )
+        if not routed_batches:
+            summary["message"] = "没有需要上传的文件。"
+            return summary
+        upload_task_by_file = {}
+        routed_batches = compress_routed_batches(
+            routed_batches,
+            config,
+            task_by_file=task_by_file,
+            upload_task_by_file=upload_task_by_file,
+        )
+        uploaded_records = upload_routed_changed_files_to_drive_batch(
+            service,
+            routed_batches,
+            parent_folder_id,
+            batch_date=batch_date,
+            batch_slot=batch_slot,
+        )
+        attach_local_task_metadata(uploaded_records, upload_task_by_file)
+        summary["uploaded_file_count"] = len(uploaded_records)
+
+        try:
+            task_sheet_count = write_task_submission_links(config, uploaded_records)
+            print(f"任务提交表格：已填写 {task_sheet_count} 条")
+            summary["task_sheet_count"] = task_sheet_count
+        except Exception as error:
+            print(f"写入任务提交表格失败：{type(error).__name__}: {error}")
+            summary["task_sheet_error"] = str(error)
+
+        review_records = [
+            record for record in uploaded_records
+            if is_review_upload_record(record, review_folder_name)
+        ]
+        if review_records:
+            try:
+                summary["review_sheet_count"] = write_review_video_links(config, review_records)
+            except Exception as error:
+                print(f"写入人工检查表格失败：{type(error).__name__}: {error}")
+                summary["review_sheet_error"] = str(error)
+        summary["person_folder_links"] = print_person_folder_links(
+            uploaded_records,
+            review_folder_name,
+        )
+    else:
+        print("整目录上传模式不会做视频检测分流。")
+        upload_local_dirs_to_drive_batch(
+            service,
+            result_dirs,
+            parent_folder_id,
+            batch_date=batch_date,
+            batch_slot=batch_slot,
+        )
+
+    summary["message"] = f"Google Drive 上传完成：{batch_date:%m%d}/{batch_slot}"
+    return summary
+
+
+class _SignalWriter:
+    def __init__(self, signal):
+        self.signal = signal
+        self.buffer = ""
+
+    def write(self, text):
+        if not text:
+            return 0
+        self.buffer += str(text).replace("\r", "\n")
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            if line.strip():
+                self.signal.emit(line)
+        return len(text)
+
+    def flush(self):
+        if self.buffer.strip():
+            self.signal.emit(self.buffer.rstrip())
+        self.buffer = ""
+
+
+class TaskResultOrganizerThread(QtCore.QThread):
+    log = QtCore.pyqtSignal(str)
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    detection_choice_requested = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        task_dates,
+        base_dir,
+        config,
+        parent=None,
+        interactive_detection_choice=False,
+    ):
+        super().__init__(parent)
+        self.task_dates = list(task_dates)
+        self.base_dir = Path(base_dir)
+        self.config = dict(config or {})
+        self.interactive_detection_choice = bool(interactive_detection_choice)
+        self._detection_choice = "manual"
+        self._detection_choice_event = threading.Event()
+
+    def set_detection_choice(self, detection_mode):
+        selected_mode = str(detection_mode or "manual").strip().lower()
+        if selected_mode not in {"ai", "skip", "manual"}:
+            selected_mode = "manual"
+        self._detection_choice = selected_mode
+        self._detection_choice_event.set()
+
+    def _request_detection_choice(self, updated_files):
+        self._detection_choice = "manual"
+        self._detection_choice_event.clear()
+        self.detection_choice_requested.emit(
+            [str(Path(file_path)) for file_path in updated_files]
+        )
+        while not self._detection_choice_event.wait(0.2):
+            if self.isInterruptionRequested():
+                return "manual"
+        return self._detection_choice
+
+    def run(self):
+        writer = _SignalWriter(self.log)
+        try:
+            resolver = (
+                self._request_detection_choice
+                if self.interactive_detection_choice
+                else None
+            )
+            with redirect_stdout(writer), redirect_stderr(writer):
+                result = run_task_result_organizer(
+                    self.task_dates,
+                    self.base_dir,
+                    self.config,
+                    detection_mode_resolver=resolver,
+                )
+            writer.flush()
+            self.completed.emit(result)
+        except BaseException as error:
+            writer.flush()
+            self.log.emit(traceback.format_exc())
+            self.failed.emit(f"{type(error).__name__}: {error}")
