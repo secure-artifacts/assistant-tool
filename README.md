@@ -34,7 +34,7 @@ python main.py
 验证发布包来源：
 
 ```powershell
-gh attestation verify AssistantTool-Windows.zip --repo secure-artifacts/REPOSITORY_NAME
+gh attestation verify AssistantTool-Windows.zip --repo secure-artifacts/assistant-tool
 ```
 
 ## 测试
