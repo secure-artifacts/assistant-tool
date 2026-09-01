@@ -2,6 +2,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -48,13 +49,19 @@ from model.TaskReferenceDownloader import (
     TaskReferenceJob,
     partition_cached_reference_jobs,
 )
+from model.TaskResultExporter import export_task
 from model.TaskResultOrganizer import (
     attach_local_task_metadata,
     build_routed_batches,
+    clear_pending_changed_file_batches,
     compress_routed_batches,
     file_identity,
     is_review_upload_record,
+    load_pending_changed_file_batches,
+    merge_changed_file_batches,
     resolve_ask_detection_mode,
+    run_task_result_organizer,
+    save_pending_changed_file_batches,
     updated_files_from_batches,
 )
 from model.VideoElementDetector import (
@@ -476,7 +483,7 @@ class TaskTableSchemaTests(unittest.TestCase):
         headers = [
             "date", "requester", "title", "source_text", "content",
             "reference", "approach", "priority", "operator", "category",
-            "completed_at", "progress", "result_url", "status", "issue", "reviewer",
+            "completed_at", "progress", "result_url", "status",
         ]
         header_row, columns = resolve_task_submission_layout(
             [headers], TEST_TASK_TABLE_SCHEMA
@@ -496,15 +503,15 @@ class TaskTableSchemaTests(unittest.TestCase):
         )
         self.assertEqual(column_letter(columns["product_link"]), "M")
 
-    def test_google_submission_reader_uses_one_grid_safe_table_request(self):
+    def test_google_submission_reader_uses_unbounded_sheet_request(self):
         headers = [
             "date", "requester", "title", "source_text", "content",
             "reference", "approach", "priority", "operator", "category",
-            "completed_at", "progress", "result_url", "status", "issue", "reviewer",
+            "completed_at", "progress", "result_url", "status",
         ]
         data_row = [
             "08/24", "Alice", "page", "hello world example", "translated",
-            "", "", "", "", "short-video", "", "new", "", "", "", "",
+            "", "", "", "", "short-video", "", "new", "", "",
         ]
         request = MagicMock()
         request.execute.return_value = {"values": [headers, data_row]}
@@ -527,7 +534,7 @@ class TaskTableSchemaTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["requester"], "Alice")
         values_api.get.assert_called_once()
-        self.assertTrue(values_api.get.call_args.kwargs["range"].endswith("!A:ZZ"))
+        self.assertEqual(values_api.get.call_args.kwargs["range"], "'01 video'")
         values_api.batchGet.assert_not_called()
 
     def test_google_submission_old_positions_remain_compatible(self):
@@ -578,7 +585,7 @@ class TaskTableSchemaTests(unittest.TestCase):
                 "name": "AliceMARKER-0823-2-hello world example.mp4",
                 "webViewLink": "https://drive.google.com/file/d/product123/view",
                 "relative_path": "manual-review/video.mp4",
-                "task_type_override": "short-video",
+                "local_task_type": "short-video",
             }
         ]
         updates, matched = build_task_sheet_updates(
@@ -599,6 +606,54 @@ class TaskTableSchemaTests(unittest.TestCase):
         self.assertTrue(any(value.endswith("!K2") for value in ranges))
         self.assertTrue(any(value.endswith("!N2") for value in ranges))
         self.assertTrue(any(value.endswith("!M2") for value in ranges))
+
+    def test_blank_local_task_type_leaves_google_video_type_unchanged(self):
+        column_map = {
+            "requester": 2,
+            "chinese": 4,
+            "creator": 9,
+            "video_type": 10,
+            "completed_at": 11,
+            "review_status": 14,
+            "product_link": 13,
+        }
+        rows = [{
+            "row": 2,
+            "requester": "Alice",
+            "chinese": "hello world example",
+            "creator": "",
+            "video_type": "existing-google-value",
+            "completed_at": "",
+            "review_status": "",
+            "product_link": "",
+            "requester_key": "alice",
+            "task_text_key": "helloworldexample",
+            "task_filename_key": "helloworldexample",
+        }]
+        records = [{
+            "name": "AliceMARKER-0823-2-hello world example.mp4",
+            "webViewLink": "https://drive.google.com/file/d/product123/view",
+            "relative_path": "Alice/video.mp4",
+        }]
+
+        updates, matched = build_task_sheet_updates(
+            {
+                "task_submission_creator": "operator",
+                "task_submission_creator_marker": "MARKER",
+                "review_folder_name": "manual-review",
+            },
+            records,
+            rows,
+            "任务",
+            column_map,
+        )
+
+        ranges = [item["range"] for item in updates]
+        self.assertFalse(any(value.endswith("!J2") for value in ranges))
+        self.assertEqual(
+            matched[0]["planned_after"]["video_type"],
+            "existing-google-value",
+        )
 
 
 class TaskResultDetectionChoiceTests(unittest.TestCase):
@@ -665,6 +720,159 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
         self.assertEqual(selected, "manual")
         self.assertEqual(config["video_detection_mode"], "manual")
         self.assertEqual(received, [Path("result/video.mp4"), Path("result/readme.txt")])
+
+    def test_closing_detection_choice_cancels_without_changing_mode(self):
+        config = {
+            "video_detection_mode": "ask",
+            "enable_video_review_detection": True,
+        }
+        video = Path("result/video.mp4")
+
+        selected = resolve_ask_detection_mode(
+            config,
+            [(Path("result"), [video])],
+            resolver=lambda _files: "cancel",
+        )
+
+        self.assertEqual(selected, "cancel")
+        self.assertEqual(config["video_detection_mode"], "ask")
+
+    def test_cancelled_run_restores_pending_files_on_next_click(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            output_dir = base_dir / "0828" / "result"
+            output_dir.mkdir(parents=True)
+            video = output_dir / "pending.mp4"
+            video.write_bytes(b"video")
+            state_path = base_dir / "pending-state.json"
+            config = {
+                "run_export": True,
+                "run_upload": True,
+                "upload_only_changed_files": True,
+                "enable_video_review_detection": True,
+                "video_detection_mode": "ask",
+                "task_result_pending_file": str(state_path),
+            }
+            export_results = [
+                SimpleNamespace(output_dir=output_dir, updated_files=[video]),
+                SimpleNamespace(output_dir=output_dir, updated_files=[]),
+            ]
+            received_first = []
+            received_second = []
+
+            with patch(
+                "model.TaskResultOrganizer.export_one_date",
+                side_effect=export_results,
+            ), patch("model.TaskResultOrganizer.load_drive_service") as drive_service:
+                first = run_task_result_organizer(
+                    [date(2026, 8, 28)],
+                    base_dir,
+                    config,
+                    detection_mode_resolver=(
+                        lambda files: received_first.extend(files) or "cancel"
+                    ),
+                )
+                second = run_task_result_organizer(
+                    [date(2026, 8, 28)],
+                    base_dir,
+                    config,
+                    detection_mode_resolver=(
+                        lambda files: received_second.extend(files) or "cancel"
+                    ),
+                )
+
+            self.assertTrue(first["cancelled"])
+            self.assertTrue(second["cancelled"])
+            self.assertEqual(received_first, [video])
+            self.assertEqual(received_second, [video])
+            self.assertTrue(state_path.is_file())
+            drive_service.assert_not_called()
+
+    def test_pending_file_state_round_trip_and_clear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            root_dir = base_dir / "0828" / "result"
+            root_dir.mkdir(parents=True)
+            first = root_dir / "first.mp4"
+            second = root_dir / "second.mp4"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            config = {
+                "task_result_pending_file": str(base_dir / "pending.json"),
+            }
+            task_dates = [date(2026, 8, 28)]
+
+            saved = save_pending_changed_file_batches(
+                config,
+                base_dir,
+                task_dates,
+                [(root_dir, [first, first, second])],
+            )
+            loaded = load_pending_changed_file_batches(
+                config,
+                base_dir,
+                task_dates,
+            )
+
+            self.assertEqual(saved, 2)
+            self.assertEqual(loaded, [(root_dir, [first, second])])
+            self.assertEqual(
+                merge_changed_file_batches(loaded, [(root_dir, [second])]),
+                loaded,
+            )
+            clear_pending_changed_file_batches(config, base_dir, task_dates)
+            self.assertFalse(Path(config["task_result_pending_file"]).exists())
+
+    def test_export_callback_keeps_task_metadata_for_unchanged_pending_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root_dir = Path(directory)
+            task_dir = root_dir / "task" / "1"
+            task_dir.mkdir(parents=True)
+            source = task_dir / "final.mp4"
+            source.write_bytes(b"video")
+            output_dir = root_dir / "result"
+            output_wsp = root_dir / "result-wsp"
+            task = SimpleNamespace(
+                task_id="1",
+                admin="Alice",
+                creator="Operator",
+                task_date="0828",
+                task_name="Title",
+                task_type="video",
+            )
+            profile = {
+                "mode": "single",
+                "task_dir": "task",
+                "candidate_names": ["final.mp4"],
+                "output_name_template": "{task_id}.mp4",
+            }
+            config = {"task_output_name_template": "{task_id}.mp4"}
+
+            export_task(
+                task,
+                date(2026, 8, 28),
+                root_dir,
+                output_dir,
+                output_wsp,
+                profile,
+                config,
+                False,
+            )
+            remembered = []
+            updated = export_task(
+                task,
+                date(2026, 8, 28),
+                root_dir,
+                output_dir,
+                output_wsp,
+                profile,
+                config,
+                False,
+                exported_file_callback=lambda path, value: remembered.append((path, value)),
+            )
+
+            self.assertEqual(updated, [])
+            self.assertEqual(remembered, [(output_dir / "1.mp4", task)])
 
     def test_ask_mode_does_not_prompt_without_detectable_video(self):
         config = {
@@ -956,9 +1164,24 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
         records = [{"local_file": str(batches[0][1][0])}]
         attach_local_task_metadata(records, upload_tasks)
 
-        self.assertEqual(records[0]["task_type_override"], "short-video")
+        self.assertEqual(records[0]["local_task_type"], "short-video")
         self.assertIs(records[0]["review_required_override"], False)
         self.assertEqual(records[0]["local_task_row"], 7)
+
+    def test_default_task_type_is_not_attached_for_google_writeback(self):
+        video = Path("result/default-type.mp4")
+        task = SimpleNamespace(
+            task_type="reels",
+            task_type_from_table=False,
+            review_required=None,
+            source_row=8,
+        )
+        records = [{"local_file": str(video)}]
+
+        attach_local_task_metadata(records, {file_identity(video): task})
+
+        self.assertNotIn("local_task_type", records[0])
+        self.assertEqual(records[0]["local_task_row"], 8)
 
 
 if __name__ == "__main__":
