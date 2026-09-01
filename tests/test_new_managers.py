@@ -783,8 +783,10 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
 
             self.assertTrue(first["cancelled"])
             self.assertTrue(second["cancelled"])
-            self.assertEqual(received_first, [video])
-            self.assertEqual(received_second, [video])
+            self.assertEqual(len(received_first), 1)
+            self.assertEqual(len(received_second), 1)
+            self.assertTrue(received_first[0].samefile(video))
+            self.assertTrue(received_second[0].samefile(video))
             self.assertTrue(state_path.is_file())
             drive_service.assert_not_called()
 
@@ -815,7 +817,12 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
             )
 
             self.assertEqual(saved, 2)
-            self.assertEqual(loaded, [(root_dir, [first, second])])
+            self.assertEqual(len(loaded), 1)
+            loaded_root, loaded_files = loaded[0]
+            self.assertTrue(loaded_root.samefile(root_dir))
+            self.assertEqual(len(loaded_files), 2)
+            self.assertTrue(loaded_files[0].samefile(first))
+            self.assertTrue(loaded_files[1].samefile(second))
             self.assertEqual(
                 merge_changed_file_batches(loaded, [(root_dir, [second])]),
                 loaded,
