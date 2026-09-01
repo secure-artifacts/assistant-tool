@@ -12,6 +12,7 @@
 
 # Private operational records and personal data
 /TaskSubmissionLog.jsonl
+/TaskResultPendingFiles.json
 /GoogleSheetMonitorState.json
 /InventoryState.json
 /TaskReferenceDownloadState.json
