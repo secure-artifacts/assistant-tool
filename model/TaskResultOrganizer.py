@@ -33,6 +33,8 @@ from model.VideoElementDetector import (
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 LEGACY_TASK_RESULT_CONFIG = APP_ROOT / "model" / "task_result_organizer" / "defaults.json"
+DEFAULT_PENDING_FILE_STATE = APP_ROOT / "TaskResultPendingFiles.json"
+PENDING_FILE_STATE_VERSION = 1
 
 TASK_RESULT_DEFAULTS = {
     "run_export": True,
@@ -234,6 +236,148 @@ def updated_files_from_batches(
     return updated_files
 
 
+def merge_changed_file_batches(
+    *batch_groups: Iterable[Tuple[Path, Iterable[Path]]],
+) -> List[Tuple[Path, List[Path]]]:
+    """Merge batches without losing their original order or duplicating files."""
+    merged = []
+    batch_indexes = {}
+    seen_files = set()
+    for batches in batch_groups:
+        for root_dir, files in batches:
+            root_path = Path(root_dir)
+            root_key = file_identity(root_path)
+            if root_key not in batch_indexes:
+                batch_indexes[root_key] = len(merged)
+                merged.append((root_path, []))
+            target_files = merged[batch_indexes[root_key]][1]
+            for file_path in files:
+                path = Path(file_path)
+                file_key = file_identity(path)
+                if file_key in seen_files:
+                    continue
+                seen_files.add(file_key)
+                target_files.append(path)
+    return [(root, files) for root, files in merged if files]
+
+
+def pending_file_state_path(config: Dict) -> Path:
+    configured = config_str(config, "task_result_pending_file")
+    path = Path(configured) if configured else DEFAULT_PENDING_FILE_STATE
+    if not path.is_absolute():
+        path = APP_ROOT / path
+    return path
+
+
+def _pending_scope_key(base_dir: Path, task_dates: Iterable[date]) -> str:
+    dates = sorted(
+        item.isoformat() if hasattr(item, "isoformat") else str(item)
+        for item in task_dates
+    )
+    return "{}|{}".format(file_identity(base_dir), ",".join(dates))
+
+
+def _read_pending_file_state(state_path: Path) -> Dict:
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        state = {}
+    except (OSError, ValueError, TypeError) as error:
+        print(f"读取待上传文件列表失败，已忽略损坏记录：{error}")
+        state = {}
+    scopes = state.get("scopes") if isinstance(state, dict) else None
+    return {
+        "version": PENDING_FILE_STATE_VERSION,
+        "scopes": scopes if isinstance(scopes, dict) else {},
+    }
+
+
+def _write_pending_file_state(state_path: Path, state: Dict) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = state_path.with_name(state_path.name + ".tmp")
+    temp_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, state_path)
+
+
+def load_pending_changed_file_batches(
+    config: Dict,
+    base_dir: Path,
+    task_dates: Iterable[date],
+) -> List[Tuple[Path, List[Path]]]:
+    state = _read_pending_file_state(pending_file_state_path(config))
+    scope = state["scopes"].get(_pending_scope_key(base_dir, task_dates), {})
+    batches = []
+    for item in scope.get("batches", []) if isinstance(scope, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        root_dir = Path(str(item.get("root_dir") or ""))
+        files = [
+            Path(str(file_path))
+            for file_path in item.get("files", [])
+            if str(file_path).strip() and Path(str(file_path)).is_file()
+        ]
+        if files:
+            batches.append((root_dir, files))
+    return merge_changed_file_batches(batches)
+
+
+def save_pending_changed_file_batches(
+    config: Dict,
+    base_dir: Path,
+    task_dates: Iterable[date],
+    changed_file_batches: Iterable[Tuple[Path, Iterable[Path]]],
+) -> int:
+    valid_batches = []
+    for root_dir, files in merge_changed_file_batches(changed_file_batches):
+        valid_files = [Path(file_path) for file_path in files if Path(file_path).is_file()]
+        if valid_files:
+            valid_batches.append((Path(root_dir), valid_files))
+
+    state_path = pending_file_state_path(config)
+    state = _read_pending_file_state(state_path)
+    scope_key = _pending_scope_key(base_dir, task_dates)
+    if not valid_batches:
+        state["scopes"].pop(scope_key, None)
+    else:
+        state["scopes"][scope_key] = {
+            "base_dir": str(Path(base_dir).resolve()),
+            "task_dates": [
+                item.isoformat() if hasattr(item, "isoformat") else str(item)
+                for item in task_dates
+            ],
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "batches": [
+                {
+                    "root_dir": str(root_dir.resolve()),
+                    "files": [str(file_path.resolve()) for file_path in files],
+                }
+                for root_dir, files in valid_batches
+            ],
+        }
+    _write_pending_file_state(state_path, state)
+    return len(updated_files_from_batches(valid_batches))
+
+
+def clear_pending_changed_file_batches(
+    config: Dict,
+    base_dir: Path,
+    task_dates: Iterable[date],
+) -> None:
+    state_path = pending_file_state_path(config)
+    state = _read_pending_file_state(state_path)
+    state["scopes"].pop(_pending_scope_key(base_dir, task_dates), None)
+    if state["scopes"]:
+        _write_pending_file_state(state_path, state)
+    else:
+        try:
+            state_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def resolve_ask_detection_mode(
     config: Dict,
     changed_file_batches: Iterable[Tuple[Path, Iterable[Path]]],
@@ -260,6 +404,8 @@ def resolve_ask_detection_mode(
 
     selected_mode = "ai" if resolver is None else str(resolver(updated_files) or "")
     selected_mode = selected_mode.strip().lower()
+    if selected_mode == "cancel":
+        return selected_mode
     if selected_mode not in {"ai", "skip", "manual"}:
         raise ValueError(f"不支持的视频检测方式：{selected_mode or '空'}")
     config["video_detection_mode"] = selected_mode
@@ -420,8 +566,13 @@ def attach_local_task_metadata(
         task = task_for_file(upload_task_by_file, Path(str(local_file)))
         if task is None:
             continue
+        # Only an explicit value from the local registration sheet may be sent
+        # to the Google sheet's video-type column.  The export profile/default
+        # task type is routing information and must never leak into writeback.
         if bool(getattr(task, "task_type_from_table", False)):
-            record["task_type_override"] = str(getattr(task, "task_type", "") or "").strip()
+            local_task_type = str(getattr(task, "task_type", "") or "").strip()
+            if local_task_type:
+                record["local_task_type"] = local_task_type
         review_required = getattr(task, "review_required", None)
         if isinstance(review_required, bool):
             record["review_required_override"] = review_required
@@ -496,17 +647,47 @@ def run_task_result_organizer(
         summary["message"] = "整理完成，设置中已关闭上传。"
         return summary
 
-    if only_changed and not changed_file_batches:
-        summary["message"] = "没有本次新增或更新的文件，已跳过 Google Drive 上传。"
-        return summary
-
     if only_changed:
-        resolve_ask_detection_mode(
+        pending_batches = load_pending_changed_file_batches(
+            config,
+            base_dir,
+            task_dates,
+        )
+        pending_count = len(updated_files_from_batches(pending_batches))
+        changed_file_batches = merge_changed_file_batches(
+            pending_batches,
+            changed_file_batches,
+        )
+        summary["changed_file_count"] = len(
+            updated_files_from_batches(changed_file_batches)
+        )
+        if not changed_file_batches:
+            summary["message"] = "没有本次新增或更新的文件，已跳过 Google Drive 上传。"
+            return summary
+        if pending_count:
+            print(f"已恢复上次保留的待处理文件：{pending_count} 个")
+        saved_count = save_pending_changed_file_batches(
+            config,
+            base_dir,
+            task_dates,
+            changed_file_batches,
+        )
+        print(f"已保存本轮待处理文件列表：{saved_count} 个")
+
+        selected_mode = resolve_ask_detection_mode(
             config,
             changed_file_batches,
             resolver=detection_mode_resolver,
             task_by_file=task_by_file,
         )
+        if selected_mode == "cancel":
+            summary["cancelled"] = True
+            summary["message"] = (
+                f"已取消本次操作，{saved_count} 个待处理文件已保留，"
+                "下次点击“整理任务结果”会继续显示。"
+            )
+            print(summary["message"])
+            return summary
 
     configured_parent = config_str(config, "drive_parent_folder_id")
     if not configured_parent:
@@ -523,6 +704,7 @@ def run_task_result_organizer(
             task_by_file=task_by_file,
         )
         if not routed_batches:
+            clear_pending_changed_file_batches(config, base_dir, task_dates)
             summary["message"] = "没有需要上传的文件。"
             return summary
         upload_task_by_file = {}
@@ -564,6 +746,7 @@ def run_task_result_organizer(
             uploaded_records,
             review_folder_name,
         )
+        clear_pending_changed_file_batches(config, base_dir, task_dates)
     else:
         print("整目录上传模式不会做视频检测分流。")
         upload_local_dirs_to_drive_batch(
@@ -618,25 +801,25 @@ class TaskResultOrganizerThread(QtCore.QThread):
         self.base_dir = Path(base_dir)
         self.config = dict(config or {})
         self.interactive_detection_choice = bool(interactive_detection_choice)
-        self._detection_choice = "manual"
+        self._detection_choice = "cancel"
         self._detection_choice_event = threading.Event()
 
     def set_detection_choice(self, detection_mode):
-        selected_mode = str(detection_mode or "manual").strip().lower()
-        if selected_mode not in {"ai", "skip", "manual"}:
-            selected_mode = "manual"
+        selected_mode = str(detection_mode or "cancel").strip().lower()
+        if selected_mode not in {"ai", "skip", "manual", "cancel"}:
+            selected_mode = "cancel"
         self._detection_choice = selected_mode
         self._detection_choice_event.set()
 
     def _request_detection_choice(self, updated_files):
-        self._detection_choice = "manual"
+        self._detection_choice = "cancel"
         self._detection_choice_event.clear()
         self.detection_choice_requested.emit(
             [str(Path(file_path)) for file_path in updated_files]
         )
         while not self._detection_choice_event.wait(0.2):
             if self.isInterruptionRequested():
-                return "manual"
+                return "cancel"
         return self._detection_choice
 
     def run(self):

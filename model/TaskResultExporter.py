@@ -69,7 +69,11 @@ def copy_if_updated(src: Path, dst: Path) -> bool:
     return True
 
 
-def copytree_if_updated(src_dir: Path, dst_dir: Path) -> List[Path]:
+def copytree_if_updated(
+    src_dir: Path,
+    dst_dir: Path,
+    destination_callback: Optional[Callable[[Path], None]] = None,
+) -> List[Path]:
     src_dir = Path(src_dir)
     dst_dir = Path(dst_dir)
     if not src_dir.exists():
@@ -81,6 +85,8 @@ def copytree_if_updated(src_dir: Path, dst_dir: Path) -> List[Path]:
             dst_file = dst_dir / src_file.relative_to(src_dir)
             if copy_if_updated(src_file, dst_file):
                 updated_files.append(dst_file)
+            if destination_callback is not None:
+                destination_callback(dst_file)
     return updated_files
 
 
@@ -111,7 +117,12 @@ def export_task(
     profile: Dict,
     config: Dict,
     wsp_export: bool,
+    exported_file_callback: Optional[Callable[[Path, Any], None]] = None,
 ) -> List[Path]:
+    def remember_output(file_path: Path) -> None:
+        if exported_file_callback is not None:
+            exported_file_callback(Path(file_path), task)
+
     mode = str(profile.get("mode") or "single").strip().lower()
     task_dir_name = render_template(profile.get("task_dir", ""), task, task_date)
     if not task_dir_name:
@@ -130,6 +141,7 @@ def export_task(
             dst = output_dir / output_name(task, task_date, config, profile)
             if copy_if_updated(result_file, dst):
                 updated.append(dst)
+            remember_output(dst)
 
         wsp_name = str(profile.get("wsp_candidate") or "").strip()
         if wsp_export and wsp_name:
@@ -138,6 +150,7 @@ def export_task(
                 dst = output_dir_wsp / output_name(task, task_date, config, profile)
                 if copy_if_updated(wsp_file, dst):
                     updated.append(dst)
+                remember_output(dst)
         return updated
 
     if mode == "all_videos":
@@ -154,6 +167,7 @@ def export_task(
             )
             if copy_if_updated(video_file, dst):
                 updated.append(dst)
+            remember_output(dst)
         return updated
 
     if mode == "copy_tree":
@@ -165,7 +179,11 @@ def export_task(
             or "{task_id}-{task_name}"
         )
         directory_name = render_template(directory_template, task, task_date)
-        return copytree_if_updated(task_dir, output_dir / directory_name)
+        return copytree_if_updated(
+            task_dir,
+            output_dir / directory_name,
+            destination_callback=remember_output,
+        )
 
     print(f"未知导出模式，已跳过：{mode}")
     return []
@@ -227,11 +245,9 @@ def export_one_date(
             profile,
             config,
             wsp_export,
+            exported_file_callback=exported_file_callback,
         )
         updated_files.extend(task_updated_files)
-        if exported_file_callback is not None:
-            for file_path in task_updated_files:
-                exported_file_callback(Path(file_path), task)
 
     print(f"整理完成：{output_dir}")
     print(f"本次新增/更新文件数：{len(updated_files)}")

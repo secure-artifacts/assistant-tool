@@ -268,13 +268,15 @@ def read_task_sheet_rows(
         if schema is None
         else normalize_task_table_schema(schema)
     )
-    # Read a single, consistent table snapshot starting at column A.  Google
-    # Sheets safely clips the right edge to the sheet grid.  Requesting each
-    # previously detected column separately can fail after columns are removed
-    # (for example, asking for Q:Q after a sheet is reduced to A:P).
+    # Read one consistent snapshot of the worksheet's used range.  Do not put a
+    # fixed right edge such as ZZ in the A1 range: Google rejects that request
+    # when the worksheet grid has fewer columns.  A quoted sheet name by itself
+    # lets the API return the used range and remains valid when columns move,
+    # are added, or are removed.
+    safe_sheet_name = sheet_name.replace("'", "''")
     table_response = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=sheet_range(sheet_name, "A:ZZ"),
+        range="'{}'".format(safe_sheet_name),
         valueRenderOption="FORMULA",
         majorDimension="ROWS",
     ).execute()
@@ -434,8 +436,11 @@ def build_task_sheet_updates(
         planned_creator = str(row["creator"]).strip() or creator
         planned_completed_at = str(row["completed_at"]).strip() or today_text
         planned_review_status = review_status if needs_review else str(row.get("review_status", ""))
-        local_video_type = str(record.get("task_type_override") or "").strip()
-        planned_video_type = local_video_type or str(row.get("video_type", "")).strip()
+        # The Google video-type cell mirrors only the explicit task type from
+        # the local registration sheet.  Empty local cells leave Google as-is;
+        # defaults, export profiles and upload folders are never used here.
+        local_task_type = str(record.get("local_task_type") or "").strip()
+        planned_video_type = local_task_type or str(row.get("video_type", "")).strip()
         if not str(row["creator"]).strip():
             updates.append({
                 "range": sheet_range(
@@ -460,8 +465,8 @@ def build_task_sheet_updates(
                 ),
                 "values": [[review_status]],
             })
-        if local_video_type and "video_type" in column_map:
-            if str(row.get("video_type", "")).strip() != local_video_type:
+        if local_task_type and "video_type" in column_map:
+            if str(row.get("video_type", "")).strip() != local_task_type:
                 updates.append({
                     "range": sheet_range(
                         sheet_name,
@@ -470,9 +475,9 @@ def build_task_sheet_updates(
                             row_number,
                         ),
                     ),
-                    "values": [[local_video_type]],
+                    "values": [[local_task_type]],
                 })
-        elif local_video_type:
+        elif local_task_type:
             print("任务提交表格没有视频类型列，已跳过本地任务类型回写。")
         updates.append({
             "range": sheet_range(
@@ -504,7 +509,7 @@ def build_task_sheet_updates(
                 "remote_prefix": record.get("remote_prefix"),
                 "needs_review": needs_review,
                 "review_required_override": record.get("review_required_override"),
-                "task_type_override": local_video_type,
+                "task_type_override": local_task_type,
             },
             "before": {
                 "requester": row["requester"],
