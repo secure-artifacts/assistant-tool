@@ -76,7 +76,7 @@ class UpdatedFilesDetectionDialog(QtWidgets.QDialog):
     def __init__(self, updated_files, parent=None):
         super().__init__(parent)
         self.updated_files = [pathlib.Path(path) for path in updated_files]
-        self.selected_mode = 'manual'
+        self.selected_mode = 'cancel'
         self.setWindowTitle('选择视频审核方式')
         self.setModal(True)
         self.resize(900, 520)
@@ -128,6 +128,11 @@ class UpdatedFilesDetectionDialog(QtWidgets.QDialog):
         open_button.clicked.connect(self.openSelectedFile)
         button_layout.addWidget(open_button)
         button_layout.addStretch(1)
+
+        cancel_button = QtWidgets.QPushButton('取消本次操作', self)
+        cancel_button.setToolTip('停止本次整理和上传，并保留文件列表供下次继续')
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
 
         manual_button = QtWidgets.QPushButton('逐个手动审核', self)
         manual_button.setToolTip('逐个显示抽帧图，由你人工判断')
@@ -853,14 +858,14 @@ class MainDialog(QtWidgets.QDialog, Ui_MainDialog):
         self.appendLog(text, end='')
 
     def onTaskResultDetectionChoiceRequested(self, updated_files):
-        selected_mode = 'manual'
+        selected_mode = 'cancel'
         try:
             dialog = UpdatedFilesDetectionDialog(updated_files, self)
-            dialog.exec_()
-            selected_mode = dialog.selected_mode
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                selected_mode = dialog.selected_mode
         except BaseException as error:
             self.appendLog(
-                f'显示更新文件列表失败，已切换为手动审核：{error}',
+                f'显示更新文件列表失败，已取消本次操作：{error}',
                 end='',
             )
         finally:
@@ -872,6 +877,7 @@ class MainDialog(QtWidgets.QDialog, Ui_MainDialog):
             'ai': '使用 AI 检测',
             'skip': '无需检测',
             'manual': '逐个手动审核',
+            'cancel': '取消本次操作，保留待处理列表',
         }
         self.appendLog(
             f'本轮视频处理方式：{mode_names.get(selected_mode, selected_mode)}',
@@ -879,6 +885,14 @@ class MainDialog(QtWidgets.QDialog, Ui_MainDialog):
         )
 
     def onTaskResultCompleted(self, result):
+        if result.get('cancelled'):
+            QMessageBox.information(
+                self,
+                '已取消整理任务结果',
+                str(result.get('message') or '本次操作已取消。'),
+            )
+            return
+
         if bool(load_task_result_config(self.load_config()).get('open_result_dir', True)):
             for directory in result.get('result_dirs', []):
                 path = pathlib.Path(directory)
