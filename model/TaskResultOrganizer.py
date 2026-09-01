@@ -188,7 +188,14 @@ def is_compressed_video(file_path: Path) -> bool:
 
 
 def file_identity(file_path: Path) -> str:
-    return os.path.normcase(os.path.abspath(str(Path(file_path))))
+    path = Path(file_path)
+    try:
+        # resolve() also expands Windows 8.3 aliases (for example RUNNER~1),
+        # so the same file cannot be queued twice under short and long paths.
+        path = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        path = Path(os.path.abspath(str(path)))
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
 def task_for_file(task_by_file: Optional[Dict[str, Any]], file_path: Path):
