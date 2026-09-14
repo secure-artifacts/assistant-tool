@@ -2744,7 +2744,10 @@ class DailyLinkHistoryTests(unittest.TestCase):
 
         text = format_daily_links(history, now.date().isoformat())
 
-        self.assertIn(now.strftime("%Y年%m月%d日"), text)
+        expected_heading = (
+            f"{now.year:04d}年{now.month:02d}月{now.day:02d}日"
+        )
+        self.assertIn(expected_heading, text)
         self.assertIn("Alice：\n批次 02：https://example.test/alice", text)
         self.assertIn("Bob：\n批次 02：https://example.test/bob", text)
 

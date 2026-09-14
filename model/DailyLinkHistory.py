@@ -281,7 +281,11 @@ def format_daily_links(history, day_key) -> str:
     normalized = normalize_daily_link_history(history)
     people = normalized.get(str(day_key), {}).get("people", {})
     day = _date_value(day_key)
-    heading = day.strftime("%Y年%m月%d日") if day else str(day_key)
+    heading = (
+        f"{day.year:04d}年{day.month:02d}月{day.day:02d}日"
+        if day
+        else str(day_key)
+    )
     sections = [heading]
     for person, slots in sorted(people.items()):
         sections.append(format_person_daily_links(person, slots))
