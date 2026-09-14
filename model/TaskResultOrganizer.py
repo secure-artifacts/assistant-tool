@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import shutil
+import subprocess
 import threading
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -21,7 +23,11 @@ from model.GoogleDriveHelper import (
 from model.GoogleSheetsHelper import write_review_video_links
 from model.OdsHelper import normalize_subcategory_path
 from model.TaskResultExporter import export_one_date
-from model.TaskSubmissionHelper import write_task_submission_links
+from model.TaskSubmissionHelper import (
+    task_sheet_failures_for_records,
+    write_task_submission_links,
+)
+from model.VideoUploadHistory import record_video_uploads
 from model.VideoCompressor import compress_video
 from model import VideoElementDetector as video_element_detector
 from model.VideoElementDetector import (
@@ -35,6 +41,7 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 LEGACY_TASK_RESULT_CONFIG = APP_ROOT / "model" / "task_result_organizer" / "defaults.json"
 DEFAULT_PENDING_FILE_STATE = APP_ROOT / "TaskResultPendingFiles.json"
 PENDING_FILE_STATE_VERSION = 1
+DEFAULT_ORAL_SOURCE_DIR_NAME = "口播"
 
 TASK_RESULT_DEFAULTS = {
     "run_export": True,
@@ -55,7 +62,13 @@ TASK_RESULT_DEFAULTS = {
     "upload_date_override": "",
     "upload_slot_override": "",
     "review_sheet_enabled": True,
+    "review_status_monitor_enabled": True,
+    "review_status_monitor_poll_seconds": 300,
     "task_submission_sheet_enabled": True,
+    "video_upload_history_enabled": True,
+    "video_upload_history_retention_days": 31,
+    "video_upload_replace_old_enabled": True,
+    "task_output_filename_max_length": 50,
 }
 
 MIGRATED_FILE_NAMES = {
@@ -202,6 +215,94 @@ def task_for_file(task_by_file: Optional[Dict[str, Any]], file_path: Path):
     if not task_by_file:
         return None
     return task_by_file.get(file_identity(file_path))
+
+
+def task_source_dir_name(task, config: Optional[Dict[str, Any]] = None) -> str:
+    """Return the configured source directory used to export one local task."""
+
+    effective_config = config if isinstance(config, dict) else {}
+    profiles = effective_config.get("task_export_profiles") or {}
+    if not isinstance(profiles, dict) or task is None:
+        return ""
+    profile = profiles.get(str(getattr(task, "task_type", "") or "").strip())
+    if not isinstance(profile, dict):
+        return ""
+    return str(profile.get("task_dir") or "").strip()
+
+
+def task_uses_oral_source_dir(task, config: Optional[Dict[str, Any]] = None) -> bool:
+    """Identify oral tasks from the export source directory, not their filename."""
+
+    effective_config = config if isinstance(config, dict) else {}
+    oral_dir_name = config_str(
+        effective_config,
+        "task_oral_source_dir_name",
+        DEFAULT_ORAL_SOURCE_DIR_NAME,
+    ) or DEFAULT_ORAL_SOURCE_DIR_NAME
+    source_dir = task_source_dir_name(task, effective_config)
+    source_parts = [
+        part.strip().casefold()
+        for part in re.split(r"[\\/]+", source_dir)
+        if part.strip()
+    ]
+    return oral_dir_name.strip().casefold() in source_parts
+
+
+def local_video_duration_millis(
+    file_path: Path,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Read a local video's duration without introducing another dependency."""
+
+    path = Path(file_path)
+    effective_config = config if isinstance(config, dict) else {}
+    configured_probe = config_str(effective_config, "task_result_ffprobe_path")
+    probe_path = configured_probe or shutil.which("ffprobe") or ""
+    if probe_path and Path(probe_path).is_file():
+        try:
+            completed = subprocess.run(
+                [
+                    str(probe_path),
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode == 0:
+                seconds = float((completed.stdout or "").strip())
+                if seconds >= 0:
+                    return int(round(seconds * 1000))
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+            pass
+
+    capture = None
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            return None
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if fps <= 0 or frame_count <= 0:
+            return None
+        return int(round(frame_count / fps * 1000))
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    finally:
+        if capture is not None:
+            capture.release()
 
 
 def review_override_for_file(
@@ -565,6 +666,7 @@ def compress_routed_batches(
 def attach_local_task_metadata(
     uploaded_records: Iterable[Dict],
     upload_task_by_file: Optional[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
 ) -> None:
     for record in uploaded_records:
         local_file = record.get("local_file")
@@ -573,19 +675,54 @@ def attach_local_task_metadata(
         task = task_for_file(upload_task_by_file, Path(str(local_file)))
         if task is None:
             continue
-        # Only an explicit value from the local registration sheet may be sent
-        # to the Google sheet's video-type column.  The export profile/default
-        # task type is routing information and must never leak into writeback.
-        if bool(getattr(task, "task_type_from_table", False)):
-            local_task_type = str(getattr(task, "task_type", "") or "").strip()
-            if local_task_type:
-                record["local_task_type"] = local_task_type
+        # Routing type and submission type are separate local columns.  Only
+        # the explicit submission type may be sent to Google's video-type
+        # column; an empty submission cell deliberately leaves Google as-is.
+        has_submission_field = hasattr(task, "submission_task_type")
+        if bool(getattr(task, "submission_task_type_from_table", False)):
+            submission_task_type = str(
+                getattr(task, "submission_task_type", "") or ""
+            ).strip()
+            if submission_task_type:
+                record["local_task_type"] = submission_task_type
+        elif not has_submission_field and bool(
+            getattr(task, "task_type_from_table", False)
+        ):
+            # Compatibility for callers still providing the pre-split TaskData
+            # shape.  Newly parsed task sheets always take the branch above.
+            legacy_task_type = str(getattr(task, "task_type", "") or "").strip()
+            if legacy_task_type:
+                record["local_task_type"] = legacy_task_type
         review_required = getattr(task, "review_required", None)
         if isinstance(review_required, bool):
             record["review_required_override"] = review_required
         source_row = getattr(task, "source_row", None)
         if source_row is not None:
             record["local_task_row"] = source_row
+        # The review sheet itself does not contain the local administrator.
+        # Keep this metadata beside the submitted Drive link so a later
+        # approval can tell the user exactly who should receive the result.
+        record["local_admin"] = str(getattr(task, "admin", "") or "").strip()
+        record["local_task_name"] = str(
+            getattr(task, "task_name", "") or ""
+        ).strip()
+        record["local_task_id"] = str(
+            getattr(task, "task_id", "") or ""
+        ).strip()
+        record["local_task_date"] = str(
+            getattr(task, "task_date", "") or ""
+        ).strip()
+        if task_uses_oral_source_dir(task, config):
+            record["local_is_oral"] = True
+            duration_millis = local_video_duration_millis(Path(str(local_file)), config)
+            if duration_millis is None:
+                print(f"口播视频时长读取失败：{Path(str(local_file)).name}")
+            else:
+                record["local_video_duration_millis"] = duration_millis
+                print(
+                    f"口播视频时长：{Path(str(local_file)).name} -> "
+                    f"{duration_millis / 1000:.3f} 秒"
+                )
 
 
 def is_review_upload_record(record: Dict, review_folder_name: str) -> bool:
@@ -703,6 +840,8 @@ def run_task_result_organizer(
     service = load_drive_service()
     batch_date, batch_slot = get_upload_batch(config)
     summary["upload_batch"] = f"{batch_date:%m%d}/{batch_slot}"
+    summary["upload_date"] = batch_date.isoformat()
+    summary["upload_slot"] = batch_slot
 
     if only_changed:
         routed_batches = build_routed_batches(
@@ -728,16 +867,71 @@ def run_task_result_organizer(
             batch_date=batch_date,
             batch_slot=batch_slot,
         )
-        attach_local_task_metadata(uploaded_records, upload_task_by_file)
+        attach_local_task_metadata(uploaded_records, upload_task_by_file, config)
         summary["uploaded_file_count"] = len(uploaded_records)
 
+        task_sheet_report = {}
         try:
-            task_sheet_count = write_task_submission_links(config, uploaded_records)
+            task_sheet_count = write_task_submission_links(
+                config,
+                uploaded_records,
+                result_report=task_sheet_report,
+                drive_service=service,
+            )
             print(f"任务提交表格：已填写 {task_sheet_count} 条")
             summary["task_sheet_count"] = task_sheet_count
         except Exception as error:
             print(f"写入任务提交表格失败：{type(error).__name__}: {error}")
             summary["task_sheet_error"] = str(error)
+            if not task_sheet_report.get("failed_files"):
+                task_sheet_report["failed_files"] = task_sheet_failures_for_records(
+                    uploaded_records,
+                    f"任务提交表格处理失败：{type(error).__name__}: {error}",
+                )
+        if task_sheet_report.get("failed_files"):
+            summary["task_sheet_failed_files"] = task_sheet_report["failed_files"]
+        if task_sheet_report.get("successful_files"):
+            summary["task_sheet_successful_files"] = task_sheet_report[
+                "successful_files"
+            ]
+
+        try:
+            upload_history_result = record_video_uploads(
+                config,
+                uploaded_records,
+                batch_date,
+                batch_slot,
+                task_sheet_report=task_sheet_report,
+                drive_service=service,
+            )
+            summary["video_upload_history"] = upload_history_result
+            if upload_history_result.get("migrated"):
+                print(
+                    "视频上传历史：已从旧任务提交日志回填 "
+                    f"{upload_history_result['migrated']} 条"
+                )
+            if upload_history_result.get("saved"):
+                print(
+                    f"视频上传历史：本次保存 {upload_history_result['saved']} 条"
+                )
+            if upload_history_result.get("archived"):
+                print(
+                    "视频上传历史：已将一个月外的记录按月压缩归档 "
+                    f"{len(upload_history_result['archived'])} 个文件"
+                )
+            if upload_history_result.get("trashed"):
+                print(
+                    "视频上传历史：已将同一成品的旧网盘版本移入回收站 "
+                    f"{len(upload_history_result['trashed'])} 个"
+                )
+            for cleanup_error in upload_history_result.get("errors", []):
+                print(
+                    "视频上传历史：旧版本清理失败，已保留记录 -> "
+                    f"{cleanup_error.get('file_name')}: {cleanup_error.get('error')}"
+                )
+        except Exception as error:
+            print(f"视频上传历史保存失败：{type(error).__name__}: {error}")
+            summary["video_upload_history_error"] = str(error)
 
         review_records = [
             record for record in uploaded_records

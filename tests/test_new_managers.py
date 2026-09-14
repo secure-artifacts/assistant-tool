@@ -1,8 +1,9 @@
 import json
+import logging
 import tempfile
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -30,6 +31,32 @@ from model.InventoryManager import (
     STATUS_NORMAL,
     current_quantity,
     item_status,
+    material_directory_stats,
+)
+from model.MaterialSourceDownloader import (
+    DownloadError,
+    download_google_drive_source,
+    parse_material_drive_link,
+    resolve_google_drive_folder_name,
+)
+from model.AudioSettings import (
+    AudioSettingsError,
+    build_audio_profile,
+    extra_settings_json,
+    normalize_audio_settings,
+    voice_lines_from_profile,
+)
+from model.AboutInfo import MAINTENANCE_LESSONS, maintenance_lessons_text
+from model.AppLogger import _create_file_handler
+from model.AudioHelper import _save_audio_with_api_keys
+from model.DailyLinkHistory import (
+    daily_link_counts,
+    daily_task_sheet_failure_count,
+    daily_task_sheet_failures,
+    format_daily_links,
+    normalize_daily_link_history,
+    record_daily_person_links,
+    update_daily_task_sheet_results,
 )
 from model.OdsHelper import (
     ReadTaskOds2,
@@ -38,18 +65,30 @@ from model.OdsHelper import (
 )
 from model.TaskTableSchema import normalize_task_table_schema
 from model.TaskSubmissionHelper import (
+    ORAL_LONG_VIDEO_TYPE,
+    ORAL_SHORT_VIDEO_TYPE,
     build_task_sheet_updates,
     column_letter,
+    ensure_sheet_row_capacity,
+    extract_product_file_name,
+    populate_link_only_product_file_names,
     read_task_sheet_rows,
     record_needs_review,
+    oral_video_type_for_record,
     resolve_task_submission_layout,
+    write_task_submission_links,
 )
 from model.TaskReferenceDownloader import (
     TaskReferenceDownloadCache,
     TaskReferenceJob,
     partition_cached_reference_jobs,
 )
-from model.TaskResultExporter import export_task
+from model.TaskResultExporter import (
+    export_task,
+    legacy_output_name,
+    limit_output_filename,
+    output_name,
+)
 from model.TaskResultOrganizer import (
     attach_local_task_metadata,
     build_routed_batches,
@@ -62,6 +101,7 @@ from model.TaskResultOrganizer import (
     resolve_ask_detection_mode,
     run_task_result_organizer,
     save_pending_changed_file_batches,
+    task_uses_oral_source_dir,
     updated_files_from_batches,
 )
 from model.VideoElementDetector import (
@@ -75,6 +115,7 @@ from model.VideoElementDetector import (
     set_runtime_config,
     tighten_detection_result,
 )
+from model.VideoCompressor import make_compressed_file_name
 
 
 TEST_TASK_TABLE_SCHEMA = normalize_task_table_schema(
@@ -85,6 +126,7 @@ TEST_TASK_TABLE_SCHEMA = normalize_task_table_schema(
             "creator": "Operator",
             "task_name": "Title",
             "task_type": "Category",
+            "submission_task_type": "Submission category",
             "task_date": "Date",
             "task_reference_link": "Reference",
             "task_audio_text": "Content",
@@ -98,6 +140,7 @@ TEST_TASK_TABLE_SCHEMA = normalize_task_table_schema(
             "creator": {"aliases": ["operator", "legacy_operator"]},
             "task_name": {"aliases": ["title", "legacy_title"], "default": "{task_id}"},
             "task_type": {"aliases": ["category", "legacy_category"], "default": "short-video"},
+            "submission_task_type": {"aliases": ["submission_category"]},
             "task_date": {"aliases": ["date", "legacy_date"]},
             "task_reference_link": {"aliases": ["reference", "legacy_reference"]},
             "task_audio_text": {"aliases": ["content", "source_text", "legacy_content"]},
@@ -107,6 +150,7 @@ TEST_TASK_TABLE_SCHEMA = normalize_task_table_schema(
         },
         "submission_sheet": {
             "labels": {
+                "task_date": "Date",
                 "requester": "Requester",
                 "chinese": "Source text",
                 "video_type": "Video type",
@@ -116,6 +160,7 @@ TEST_TASK_TABLE_SCHEMA = normalize_task_table_schema(
                 "product_link": "Result URL",
             },
             "fields": {
+                "task_date": {"aliases": ["date"]},
                 "requester": {"aliases": ["requester", "legacy_requester"]},
                 "chinese": {"aliases": ["source_text", "legacy_source"]},
                 "video_type": {"aliases": ["category", "video_type"]},
@@ -127,6 +172,136 @@ TEST_TASK_TABLE_SCHEMA = normalize_task_table_schema(
         },
     }
 )
+
+
+class AudioSettingsTests(unittest.TestCase):
+    def test_profiles_are_copied_and_unknown_fields_are_preserved(self):
+        source = {
+            "voice-a": {
+                "model": "edge",
+                "sex": "female",
+                "custom_future_option": {"enabled": True},
+            }
+        }
+        profiles = normalize_audio_settings(source)
+        profiles["voice-a"]["custom_future_option"]["enabled"] = False
+
+        self.assertTrue(source["voice-a"]["custom_future_option"]["enabled"])
+        self.assertIn("custom_future_option", extra_settings_json(source["voice-a"]))
+
+    def test_build_elevenlabs_profile_supports_per_voice_speed(self):
+        profile = build_audio_profile(
+            "elevenlabs",
+            sex="female",
+            speed=1.0,
+            voice_lines="voice-one\nvoice-two | 0.85",
+            extra_json='{"future_option": 3}',
+            original_profile={
+                "voices": [
+                    {"id": "voice-one", "future_voice_option": "preserved"}
+                ]
+            },
+        )
+
+        self.assertEqual(
+            profile["voices"][0],
+            {"id": "voice-one", "future_voice_option": "preserved"},
+        )
+        self.assertEqual(
+            profile["voices"][1],
+            {"id": "voice-two", "speed": 0.85},
+        )
+        self.assertEqual(profile["future_option"], 3)
+        self.assertEqual(
+            voice_lines_from_profile(profile),
+            "voice-one\nvoice-two | 0.85",
+        )
+
+    def test_elevenlabs_profile_requires_a_voice(self):
+        with self.assertRaises(AudioSettingsError):
+            build_audio_profile("elevenlabs", voice_lines="")
+
+
+class AboutInfoTests(unittest.TestCase):
+    def test_maintenance_lessons_are_structured_and_copyable(self):
+        self.assertGreaterEqual(len(MAINTENANCE_LESSONS), 10)
+        for lesson in MAINTENANCE_LESSONS:
+            self.assertTrue(lesson["title"].strip())
+            self.assertTrue(lesson["mistake"].strip())
+            self.assertTrue(lesson["rule"].strip())
+
+        text = maintenance_lessons_text()
+        self.assertIn("破坏原生库导入顺序", text)
+        self.assertIn("把故障延后误当成修复", text)
+        self.assertIn("以后必须遵守", text)
+
+
+class ApplicationLoggingTests(unittest.TestCase):
+    def test_file_handler_rotates_and_keeps_bounded_backups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            handler, log_path = _create_file_handler(Path(directory), 256, 2)
+            test_logger = logging.getLogger("assistant_tool_test_rotation")
+            test_logger.propagate = False
+            test_logger.setLevel(logging.INFO)
+            test_logger.addHandler(handler)
+            try:
+                for index in range(80):
+                    test_logger.info("log-line-%03d-%s", index, "x" * 40)
+            finally:
+                test_logger.removeHandler(handler)
+                handler.close()
+
+            log_files = list(log_path.parent.glob("assistant-tool.log*"))
+            self.assertGreater(len(log_files), 1)
+            self.assertLessEqual(len(log_files), 3)
+
+    def test_file_handler_keeps_python_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            handler, log_path = _create_file_handler(
+                Path(directory),
+                16 * 1024,
+                1,
+            )
+            test_logger = logging.getLogger("assistant_tool_test_traceback")
+            test_logger.propagate = False
+            test_logger.setLevel(logging.INFO)
+            test_logger.addHandler(handler)
+            try:
+                try:
+                    raise RuntimeError("traceback-marker")
+                except RuntimeError:
+                    test_logger.exception("音频处理异常")
+                handler.flush()
+            finally:
+                test_logger.removeHandler(handler)
+                handler.close()
+
+            content = log_path.read_text(encoding="utf-8")
+            self.assertIn("Traceback", content)
+            self.assertIn("RuntimeError: traceback-marker", content)
+
+    @patch("model.AudioHelper.ElevenLabs")
+    def test_audio_api_progress_uses_callback_and_masks_key(self, client_class):
+        client_class.return_value = object()
+        messages = []
+        api_key = "abcdefghijklmno"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "task_audio.mp3"
+            created = _save_audio_with_api_keys(
+                [api_key],
+                str(target),
+                lambda _client: [b"audio-data"],
+                api_key_status_config=None,
+                progress_callback=messages.append,
+            )
+
+            self.assertTrue(created)
+            self.assertEqual(target.read_bytes(), b"audio-data")
+
+        progress_text = "\n".join(messages)
+        self.assertIn("正在尝试 ElevenLabs API Key", progress_text)
+        self.assertIn("音频已保存", progress_text)
+        self.assertNotIn(api_key, progress_text)
 
 
 class InventoryTests(unittest.TestCase):
@@ -157,6 +332,736 @@ class InventoryTests(unittest.TestCase):
             self.assertEqual(store.list_items()[0]["name"], "改名库存")
             store.delete_item(created["id"])
             self.assertEqual(store.list_items(), [])
+
+    def test_material_store_copies_multiple_sources_and_check_removes_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_file = root / "logo.png"
+            source_file.write_bytes(b"image")
+            source_folder = root / "opening"
+            source_folder.mkdir()
+            (source_folder / "clip.mp4").write_bytes(b"video")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+
+            material = store.add_material(
+                "常用素材",
+                [source_file, source_folder],
+            )
+
+            saved_dir = Path(material["path"])
+            self.assertTrue((saved_dir / "logo.png").is_file())
+            self.assertTrue((saved_dir / "opening" / "clip.mp4").is_file())
+            self.assertEqual(store.list_materials()[0]["name"], "常用素材")
+            self.assertEqual(material_directory_stats(saved_dir)["file_count"], 2)
+
+            for saved_file in saved_dir.rglob("*"):
+                if saved_file.is_file():
+                    saved_file.unlink()
+            result = store.check_materials()
+
+            self.assertEqual(result["kept"], [])
+            self.assertEqual(result["removed"][0]["check_reason"], "素材目录已空")
+            self.assertEqual(store.list_materials(), [])
+
+    def test_material_can_use_first_google_folder_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+
+            def fake_copy(_sources, staging_dir, progress_callback=None):
+                (staging_dir / "clip.mp4").write_bytes(b"video")
+
+            with patch(
+                "model.InventoryManager.resolve_google_drive_folder_name",
+                return_value="Cloud Pack",
+            ) as resolver, patch.object(
+                store, "_copy_material_sources", side_effect=fake_copy
+            ):
+                material = store.add_material(
+                    "",
+                    ["https://drive.google.com/drive/folders/folder-456"],
+                    use_drive_folder_name=True,
+                )
+
+            self.assertEqual(material["name"], "Cloud Pack")
+            self.assertTrue(Path(material["path"]).name.startswith("Cloud Pack-"))
+            resolver.assert_called_once()
+
+    def test_drive_folder_auto_name_requires_a_folder_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InventoryStore(Path(directory) / "inventory.json")
+            with self.assertRaisesRegex(ValueError, "Google Drive 文件夹"):
+                store.add_material(
+                    "",
+                    ["https://drive.google.com/file/d/file-123/view"],
+                    use_drive_folder_name=True,
+                )
+
+    def test_removing_material_record_keeps_copied_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_file = root / "source.txt"
+            source_file.write_text("material", encoding="utf-8")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            material = store.add_material("文案", [source_file])
+            saved_dir = Path(material["path"])
+
+            store.remove_material_record(material["id"])
+
+            self.assertEqual(store.list_materials(), [])
+            self.assertTrue((saved_dir / "source.txt").is_file())
+
+    def test_material_store_accepts_mixed_local_and_drive_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local_file = root / "local.txt"
+            local_file.write_text("local", encoding="utf-8")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            drive_url = "https://drive.google.com/file/d/drive-file-123/view"
+            progress = []
+
+            def fake_download(url, output_dir, progress_callback=None):
+                self.assertEqual(url, drive_url)
+                target = Path(output_dir) / "cloud.mp4"
+                target.write_bytes(b"cloud")
+                if progress_callback:
+                    progress_callback("网盘文件下载完成：cloud.mp4")
+                return SimpleNamespace(downloaded_files=1)
+
+            with patch(
+                "model.InventoryManager.download_google_drive_source",
+                side_effect=fake_download,
+            ) as downloader:
+                material = store.add_material(
+                    "混合素材",
+                    [
+                        local_file,
+                        drive_url,
+                        drive_url + "?duplicate=1",
+                    ],
+                    progress_callback=progress.append,
+                )
+
+            saved_dir = Path(material["path"])
+            self.assertTrue((saved_dir / "local.txt").is_file())
+            self.assertTrue((saved_dir / "cloud.mp4").is_file())
+            self.assertEqual(downloader.call_count, 1)
+            self.assertEqual(material["source_summary"], "本地 1 / 网盘 1")
+            self.assertEqual(
+                [source["type"] for source in material["sources"]],
+                ["local", "google_drive"],
+            )
+            self.assertIn("网盘文件下载完成", "\n".join(progress))
+
+    def test_failed_drive_material_leaves_no_record_or_partial_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            with patch(
+                "model.InventoryManager.download_google_drive_source",
+                side_effect=DownloadError("没有访问权限"),
+            ):
+                with self.assertRaises(DownloadError):
+                    store.add_material(
+                        "失败素材",
+                        ["https://drive.google.com/file/d/private-file/view"],
+                    )
+
+            self.assertEqual(store.list_materials(), [])
+            self.assertEqual(list((root / "library").iterdir()), [])
+
+    def test_append_material_adds_files_to_existing_directory_and_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_source = root / "first" / "clip.mp4"
+            first_source.parent.mkdir()
+            first_source.write_bytes(b"first")
+            second_source = root / "second" / "clip.mp4"
+            second_source.parent.mkdir()
+            second_source.write_bytes(b"second")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            original = store.add_material("视频片段", [first_source])
+            original_path = original["path"]
+            original_created_at = original["created_at"]
+
+            updated = store.append_material(original["id"], [second_source])
+
+            saved_dir = Path(updated["path"])
+            self.assertEqual(updated["path"], original_path)
+            self.assertEqual(updated["created_at"], original_created_at)
+            self.assertEqual((saved_dir / "clip.mp4").read_bytes(), b"first")
+            self.assertEqual((saved_dir / "clip (2).mp4").read_bytes(), b"second")
+            self.assertEqual(updated["source_count"], 2)
+            self.assertEqual(updated["source_summary"], "本地 2")
+            self.assertEqual(len(store.list_materials()), 1)
+
+    def test_failed_append_keeps_existing_material_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "existing.txt"
+            source.write_text("keep", encoding="utf-8")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            original = store.add_material("已有素材", [source])
+            saved_dir = Path(original["path"])
+            before_record = store.list_materials()[0]
+
+            with patch(
+                "model.InventoryManager.download_google_drive_source",
+                side_effect=DownloadError("没有访问权限"),
+            ):
+                with self.assertRaises(DownloadError):
+                    store.append_material(
+                        original["id"],
+                        ["https://drive.google.com/file/d/private-file/view"],
+                    )
+
+            self.assertEqual(store.list_materials()[0], before_record)
+            self.assertEqual((saved_dir / "existing.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(saved_dir.iterdir()), [saved_dir / "existing.txt"])
+            self.assertFalse(any("append" in path.name for path in (root / "library").iterdir()))
+
+    def test_person_profile_stores_avatar_sheet_bindings_and_materials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            avatar = root / "portrait.png"
+            avatar.write_bytes(b"png")
+            first_source = root / "first" / "clip.mp4"
+            first_source.parent.mkdir()
+            first_source.write_bytes(b"first")
+            second_source = root / "second" / "clip.mp4"
+            second_source.parent.mkdir()
+            second_source.write_bytes(b"second")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            first_sheet = "https://docs.google.com/spreadsheets/d/sheet-one/edit#gid=0"
+            second_tab = "https://docs.google.com/spreadsheets/d/sheet-one/edit#gid=123"
+
+            person = store.add_person(
+                "Alice",
+                avatar_path=avatar,
+                google_sheet_links=[
+                    first_sheet,
+                    first_sheet + "&duplicate=1",
+                    second_tab,
+                ],
+                source_paths=[first_source],
+                metadata={"tag": "lead"},
+                bindings={"future_service": {"account": "A1"}},
+            )
+
+            self.assertTrue(Path(person["avatar_path"]).is_file())
+            self.assertEqual(
+                person["bindings"]["google_sheets"],
+                [first_sheet, second_tab],
+            )
+            self.assertEqual(
+                person["bindings"]["future_service"],
+                {"account": "A1"},
+            )
+            self.assertEqual(person["metadata"], {"tag": "lead"})
+            material_dir = Path(person["material_path"])
+            self.assertEqual((material_dir / "clip.mp4").read_bytes(), b"first")
+
+            updated = store.append_person_material(person["id"], [second_source])
+
+            self.assertEqual((material_dir / "clip (2).mp4").read_bytes(), b"second")
+            self.assertEqual(updated["source_count"], 2)
+            self.assertEqual(updated["source_summary"], "本地 2")
+
+    def test_person_profile_edit_preserves_extension_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            avatar = root / "portrait.jpg"
+            avatar.write_bytes(b"jpg")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            person = store.add_person(
+                "Before",
+                avatar_path=avatar,
+                google_sheet_links=[],
+                metadata={"existing": True},
+                bindings={"future_service": ["value"]},
+            )
+            new_sheet = "https://docs.google.com/spreadsheets/d/sheet-two/edit"
+
+            store.update_person_profile(
+                person["id"],
+                "After",
+                google_sheet_links=[new_sheet],
+                remove_avatar=True,
+                metadata_update={"note": "updated"},
+            )
+            reloaded = store.list_people()[0]
+
+            self.assertEqual(reloaded["name"], "After")
+            self.assertEqual(reloaded["avatar_path"], "")
+            self.assertFalse(Path(person["avatar_path"]).exists())
+            self.assertEqual(reloaded["bindings"]["google_sheets"], [new_sheet])
+            self.assertEqual(reloaded["bindings"]["future_service"], ["value"])
+            self.assertEqual(
+                reloaded["metadata"],
+                {"existing": True, "note": "updated"},
+            )
+
+    def test_empty_person_material_record_is_kept_by_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            person = store.add_person("No Assets")
+
+            result = store.check_people()
+
+            self.assertEqual(result["removed"], [])
+            self.assertEqual(result["kept"][0]["id"], person["id"])
+            self.assertTrue(Path(person["material_path"]).is_dir())
+
+    def test_failed_person_profile_write_restores_previous_avatar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_avatar = root / "old.png"
+            old_avatar.write_bytes(b"old")
+            new_avatar = root / "new.png"
+            new_avatar.write_bytes(b"new")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            person = store.add_person("Alice", avatar_path=old_avatar)
+            saved_avatar = Path(person["avatar_path"])
+
+            with patch.object(store, "_write", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    store.update_person_profile(
+                        person["id"],
+                        "Alice",
+                        avatar_path=new_avatar,
+                    )
+
+            self.assertEqual(saved_avatar.read_bytes(), b"old")
+            self.assertEqual(store.list_people()[0]["avatar_path"], str(saved_avatar))
+
+    def test_failed_person_append_keeps_profile_and_materials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "existing.mp4"
+            source.write_bytes(b"keep")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            person = store.add_person("Alice", source_paths=[source])
+            before_record = store.list_people()[0]
+
+            with patch(
+                "model.InventoryManager.download_google_drive_source",
+                side_effect=DownloadError("下载失败"),
+            ):
+                with self.assertRaises(DownloadError):
+                    store.append_person_material(
+                        person["id"],
+                        ["https://drive.google.com/file/d/private-file/view"],
+                    )
+
+            self.assertEqual(store.list_people()[0], before_record)
+            material_dir = Path(person["material_path"])
+            self.assertEqual((material_dir / "existing.mp4").read_bytes(), b"keep")
+            self.assertFalse(
+                any("append" in path.name for path in store.people_root.iterdir())
+            )
+
+    def test_person_can_import_existing_material_and_keep_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "clip.mp4"
+            source.write_bytes(b"video")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            material = store.add_material("天使素材", [source])
+            person = store.add_person("Alice")
+
+            result = store.import_materials_to_person(
+                person["id"],
+                [material["id"]],
+            )
+
+            imported_file = Path(person["material_path"]) / "天使素材" / "clip.mp4"
+            self.assertEqual(imported_file.read_bytes(), b"video")
+            self.assertTrue(Path(material["path"]).is_dir())
+            self.assertEqual(len(store.list_materials()), 1)
+            reloaded_person = store.list_people()[0]
+            self.assertEqual(reloaded_person["source_summary"], "素材库 1")
+            self.assertEqual(
+                reloaded_person["sources"][0]["original_path"],
+                str(Path(material["path"]).resolve()),
+            )
+            self.assertEqual(len(result["imported_materials"]), 1)
+            self.assertEqual(result["removed_materials"], [])
+
+    def test_person_import_can_remove_original_materials_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_source = root / "first.mp4"
+            first_source.write_bytes(b"first")
+            second_source = root / "second.mp4"
+            second_source.write_bytes(b"second")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            first = store.add_material("第一组", [first_source])
+            second = store.add_material("第二组", [second_source])
+            person = store.add_person("Alice")
+
+            result = store.import_materials_to_person(
+                person["id"],
+                [first["id"], second["id"]],
+                remove_originals=True,
+            )
+
+            person_materials = Path(person["material_path"])
+            self.assertEqual(
+                (person_materials / "第一组" / "first.mp4").read_bytes(),
+                b"first",
+            )
+            self.assertEqual(
+                (person_materials / "第二组" / "second.mp4").read_bytes(),
+                b"second",
+            )
+            self.assertEqual(store.list_materials(), [])
+            self.assertFalse(Path(first["path"]).exists())
+            self.assertFalse(Path(second["path"]).exists())
+            self.assertEqual(len(result["removed_materials"]), 2)
+            self.assertFalse(
+                any("material-import-trash" in path.name for path in store.material_root.iterdir())
+            )
+
+    def test_failed_destructive_person_import_restores_original_and_person(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.txt"
+            source.write_text("keep", encoding="utf-8")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            material = store.add_material("已有素材", [source])
+            person = store.add_person("Alice")
+            original_path = Path(material["path"])
+            before_person = store.list_people()[0]
+
+            with patch.object(store, "_write", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    store.import_materials_to_person(
+                        person["id"],
+                        [material["id"]],
+                        remove_originals=True,
+                    )
+
+            self.assertEqual(
+                (original_path / "source.txt").read_text(encoding="utf-8"),
+                "keep",
+            )
+            self.assertEqual(store.list_materials()[0]["id"], material["id"])
+            self.assertEqual(store.list_people()[0], before_person)
+            self.assertEqual(list(Path(person["material_path"]).iterdir()), [])
+            self.assertFalse(
+                any("material-import" in path.name for path in store.material_root.iterdir())
+            )
+
+
+    def test_material_images_can_be_moved_to_multiple_tasks_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            (source_dir / "cover.png").write_bytes(b"new-cover")
+            (source_dir / "portrait.jpg").write_bytes(b"portrait")
+            (source_dir / "notes.txt").write_text("keep", encoding="utf-8")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            material = store.add_material("图片素材", [source_dir])
+            images = store.list_material_images()
+            self.assertEqual(
+                {image["name"] for image in images},
+                {"cover.png", "portrait.jpg"},
+            )
+
+            first_target = root / "tasks" / "1"
+            second_target = root / "tasks" / "2"
+            first_target.mkdir(parents=True)
+            (first_target / "cover.png").write_bytes(b"existing")
+            assignments = []
+            for image in images:
+                assignments.append({
+                    "path": image["path"],
+                    "target_dir": str(
+                        first_target
+                        if image["name"] == "cover.png"
+                        else second_target
+                    ),
+                    "task_label": "任务1" if image["name"] == "cover.png" else "任务2",
+                })
+
+            result = store.move_material_images(assignments)
+
+            self.assertEqual(len(result["moved"]), 2)
+            self.assertEqual((first_target / "cover.png").read_bytes(), b"existing")
+            self.assertEqual((first_target / "cover (2).png").read_bytes(), b"new-cover")
+            self.assertEqual((second_target / "portrait.jpg").read_bytes(), b"portrait")
+            self.assertEqual(len(store.list_materials()), 1)
+            self.assertTrue(Path(material["path"]).joinpath("incoming", "notes.txt").is_file())
+
+    def test_moving_last_material_image_removes_empty_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "only.png"
+            source.write_bytes(b"image")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            material = store.add_material("一次性图片", [source])
+            image = store.list_material_images()[0]
+            target_dir = root / "task"
+
+            result = store.move_material_images([{
+                "path": image["path"],
+                "target_dir": str(target_dir),
+                "task_label": "任务A",
+            }])
+
+            self.assertEqual(store.list_materials(), [])
+            self.assertFalse(Path(material["path"]).exists())
+            self.assertEqual((target_dir / "only.png").read_bytes(), b"image")
+            self.assertEqual(result["removed_materials"][0]["id"], material["id"])
+
+    def test_material_image_move_rolls_back_when_state_write_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "only.jpg"
+            source.write_bytes(b"image")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            material = store.add_material("回滚图片", [source])
+            image = store.list_material_images()[0]
+            stored_image_path = Path(image["path"])
+            target_dir = root / "task"
+
+            with patch.object(store, "_write", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    store.move_material_images([{
+                        "path": image["path"],
+                        "target_dir": str(target_dir),
+                    }])
+
+            self.assertEqual(stored_image_path.read_bytes(), b"image")
+            self.assertFalse((target_dir / "only.jpg").exists())
+            self.assertEqual(store.list_materials()[0]["id"], material["id"])
+
+    def test_image_groups_include_material_and_person_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            material_source = root / "material.png"
+            person_source = root / "person.jpg"
+            material_source.write_bytes(b"material")
+            person_source.write_bytes(b"person")
+            store = InventoryStore(
+                root / "inventory.json",
+                material_root=root / "library",
+            )
+            store.add_material("普通素材组", [material_source])
+            person = store.add_person("Alice", source_paths=[person_source])
+
+            groups = store.list_image_groups()
+
+            self.assertEqual(
+                [(group["source_kind"], group["name"]) for group in groups],
+                [("material", "普通素材组"), ("person", "Alice")],
+            )
+            self.assertEqual([group["image_count"] for group in groups], [1, 1])
+
+            person_group = groups[1]
+            target_dir = root / "task"
+            result = store.move_material_images([{
+                "path": person_group["images"][0]["path"],
+                "target_dir": str(target_dir),
+                "task_label": "任务1",
+            }])
+
+            self.assertEqual(result["moved"][0]["source_kind"], "person")
+            self.assertEqual((target_dir / "person.jpg").read_bytes(), b"person")
+            self.assertEqual(store.list_people()[0]["id"], person["id"])
+            self.assertEqual(store.list_image_groups()[1]["image_count"], 0)
+
+
+class MaterialSourceDownloaderTests(unittest.TestCase):
+    def test_parse_file_folder_and_google_document_links(self):
+        file_link = parse_material_drive_link(
+            "https://drive.google.com/file/d/file-123/view?resourcekey=key-1"
+        )
+        folder_link = parse_material_drive_link(
+            "https://drive.google.com/drive/u/0/folders/folder-456?resourcekey=key-2"
+        )
+        doc_link = parse_material_drive_link(
+            "https://docs.google.com/document/d/document-789/edit"
+        )
+
+        self.assertEqual(file_link.identity, "file:file-123")
+        self.assertEqual(file_link.resource_key, "key-1")
+        self.assertTrue(folder_link.is_folder)
+        self.assertEqual(folder_link.identity, "folder:folder-456")
+        self.assertEqual(doc_link.google_type, "document")
+
+    def test_rejects_non_google_url(self):
+        with self.assertRaises(DownloadError):
+            parse_material_drive_link("https://example.com/file.mp4")
+
+    def test_resolve_google_drive_folder_name_reads_real_metadata(self):
+        request = MagicMock()
+        request.execute.return_value = {
+            "id": "folder-456",
+            "name": "客户补充素材",
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        files_api = MagicMock()
+        files_api.get.return_value = request
+        service = MagicMock()
+        service.files.return_value = files_api
+
+        name = resolve_google_drive_folder_name(
+            "https://drive.google.com/drive/folders/folder-456",
+            service_factory=lambda: service,
+        )
+
+        self.assertEqual(name, "客户补充素材")
+        files_api.get.assert_called_once()
+
+    def test_resolve_folder_name_rejects_google_file_link(self):
+        with self.assertRaisesRegex(DownloadError, "文件夹链接"):
+            resolve_google_drive_folder_name(
+                "https://drive.google.com/file/d/file-123/view",
+                service_factory=MagicMock,
+            )
+
+    def test_authenticated_folder_download_is_recursive_and_exports_docs(self):
+        class FakeRequest:
+            def __init__(self, payload=None, data=b""):
+                self.payload = payload
+                self.data = data
+
+            def execute(self):
+                return self.payload
+
+        class FakeFiles:
+            def get(self, fileId, **_kwargs):
+                self.requested_id = fileId
+                return FakeRequest(
+                    {
+                        "id": "folder-456",
+                        "name": "Cloud Pack",
+                        "mimeType": "application/vnd.google-apps.folder",
+                    }
+                )
+
+            def list(self, q, **_kwargs):
+                if "'folder-456'" in q:
+                    children = [
+                        {
+                            "id": "video-1",
+                            "name": "clip.mp4",
+                            "mimeType": "video/mp4",
+                        },
+                        {
+                            "id": "subfolder-1",
+                            "name": "Documents",
+                            "mimeType": "application/vnd.google-apps.folder",
+                        },
+                    ]
+                else:
+                    children = [
+                        {
+                            "id": "doc-1",
+                            "name": "Readme",
+                            "mimeType": "application/vnd.google-apps.document",
+                        }
+                    ]
+                return FakeRequest({"files": children})
+
+            def get_media(self, fileId, **_kwargs):
+                return FakeRequest(data=f"file:{fileId}".encode())
+
+            def export_media(self, fileId, mimeType):
+                return FakeRequest(data=f"export:{fileId}:{mimeType}".encode())
+
+        class FakeService:
+            def __init__(self):
+                self.files_api = FakeFiles()
+
+            def files(self):
+                return self.files_api
+
+        class FakeStatus:
+            @staticmethod
+            def progress():
+                return 1.0
+
+        class FakeDownloader:
+            def __init__(self, stream, request, chunksize):
+                self.stream = stream
+                self.request = request
+
+            def next_chunk(self):
+                self.stream.write(self.request.data)
+                return FakeStatus(), True
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            with patch("googleapiclient.http.MediaIoBaseDownload", FakeDownloader):
+                result = download_google_drive_source(
+                    "https://drive.google.com/drive/folders/folder-456",
+                    output_dir,
+                    service_factory=FakeService,
+                )
+
+            root = output_dir / "Cloud Pack"
+            self.assertEqual(result.downloaded_files, 2)
+            self.assertTrue(result.used_authenticated_api)
+            self.assertEqual((root / "clip.mp4").read_bytes(), b"file:video-1")
+            self.assertTrue((root / "Documents" / "Readme.docx").is_file())
 
 
 class SheetMonitorTests(unittest.TestCase):
@@ -479,6 +1384,66 @@ class TaskTableSchemaTests(unittest.TestCase):
             self.assertEqual(tasks[0].task_type, "short-video")
             self.assertFalse(tasks[0].task_type_from_table)
 
+    def test_routing_type_and_submission_type_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "separate-types.ods"
+            document = OpenDocumentSpreadsheet()
+            table = OdfTable(name="sample")
+            document.spreadsheet.addElement(table)
+            self._add_row(
+                table,
+                ["owner", "title", "record_id", "category", "submission_category"],
+            )
+            self._add_row(
+                table,
+                ["Alice", "task-a", "10", "routing-reels", "client-type-a"],
+            )
+            self._add_row(
+                table,
+                ["Bob", "task-b", "11", "routing-reels", ""],
+            )
+            document.save(str(path))
+
+            tasks = ReadTaskOds2(path, schema=TEST_TASK_TABLE_SCHEMA)
+
+            self.assertEqual(tasks[0].task_type, "routing-reels")
+            self.assertEqual(tasks[0].submission_task_type, "client-type-a")
+            self.assertTrue(tasks[0].submission_task_type_from_table)
+            self.assertEqual(tasks[1].task_type, "routing-reels")
+            self.assertEqual(tasks[1].submission_task_type, "")
+            self.assertFalse(tasks[1].submission_task_type_from_table)
+
+    def test_submission_type_is_legacy_routing_fallback_when_only_type_column(self):
+        schema = normalize_task_table_schema(
+            {
+                "fields": {
+                    "task_id": {"aliases": ["record_id"], "default": "{row}"},
+                    "task_name": {"aliases": ["title"], "default": "{task_id}"},
+                    "task_type": {"aliases": ["category"], "default": ""},
+                    "submission_task_type": {
+                        "aliases": ["submission_category"],
+                        "default": "",
+                    },
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-one-type.ods"
+            document = OpenDocumentSpreadsheet()
+            table = OdfTable(name="sample")
+            document.spreadsheet.addElement(table)
+            self._add_row(table, ["title", "submission_category"])
+            self._add_row(table, ["task", "legacy-routing-type"])
+            document.save(str(path))
+
+            tasks = ReadTaskOds2(path, schema=schema)
+
+            self.assertEqual(tasks[0].task_type, "legacy-routing-type")
+            self.assertEqual(
+                tasks[0].submission_task_type,
+                "legacy-routing-type",
+            )
+
     def test_google_submission_headers_use_new_positions(self):
         headers = [
             "date", "requester", "title", "source_text", "content",
@@ -492,6 +1457,7 @@ class TaskTableSchemaTests(unittest.TestCase):
         self.assertEqual(
             columns,
             {
+                "task_date": 1,
                 "requester": 2,
                 "chinese": 4,
                 "creator": 9,
@@ -607,7 +1573,7 @@ class TaskTableSchemaTests(unittest.TestCase):
         self.assertTrue(any(value.endswith("!N2") for value in ranges))
         self.assertTrue(any(value.endswith("!M2") for value in ranges))
 
-    def test_blank_local_task_type_leaves_google_video_type_unchanged(self):
+    def test_blank_local_submission_type_leaves_google_video_type_unchanged(self):
         column_map = {
             "requester": 2,
             "chinese": 4,
@@ -655,8 +1621,476 @@ class TaskTableSchemaTests(unittest.TestCase):
             "existing-google-value",
         )
 
+    def test_oral_video_is_appended_after_the_last_used_row(self):
+        column_map = {
+            "task_date": 1,
+            "requester": 2,
+            "chinese": 4,
+            "creator": 9,
+            "video_type": 10,
+            "completed_at": 11,
+            "product_link": 13,
+            "review_status": 14,
+        }
+        rows = [{
+            "row": 20,
+            "task_date": "",
+            "requester": "Other",
+            "chinese": "existing task",
+            "creator": "",
+            "video_type": "",
+            "completed_at": "",
+            "review_status": "",
+            "product_link": "",
+            "requester_key": "other",
+            "task_text_key": "existingtask",
+            "task_filename_key": "existingtask",
+        }]
+        records = [{
+            "name": "AliceMARKER-0911-7-oral title.mp4",
+            "webViewLink": "https://drive.google.com/file/d/oral123/view",
+            "local_is_oral": True,
+            "local_video_duration_millis": 60_001,
+            "local_admin": "Alice",
+            "local_task_name": "oral title",
+            "local_task_date": "2026-09-11",
+            "task_submission_completed_at": "2026-08-26",
+            "relative_path": "Alice/oral.mp4",
+        }]
+
+        updates, matched = build_task_sheet_updates(
+            {
+                "task_submission_creator": "operator",
+                "task_submission_creator_marker": "MARKER",
+                "review_folder_name": "manual-review",
+            },
+            records,
+            rows,
+            "Tasks",
+            column_map,
+            first_data_row=2,
+        )
+
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["operation"], "append_oral")
+        self.assertEqual(matched[0]["row"], 21)
+        self.assertEqual(
+            matched[0]["planned_after"]["video_type"],
+            ORAL_LONG_VIDEO_TYPE,
+        )
+        ranges = {item["range"]: item["values"][0][0] for item in updates}
+        self.assertEqual(ranges["'Tasks'!A21"], "2026-09-11")
+        self.assertEqual(ranges["'Tasks'!B21"], "Alice")
+        self.assertEqual(ranges["'Tasks'!D21"], "oral title")
+        self.assertEqual(ranges["'Tasks'!J21"], ORAL_LONG_VIDEO_TYPE)
+        self.assertEqual(ranges["'Tasks'!K21"], "2026-08-26")
+        self.assertEqual(
+            ranges["'Tasks'!M21"],
+            '=HYPERLINK("https://drive.google.com/file/d/oral123/view",'
+            '"AliceMARKER-0911-7-oral title.mp4")',
+        )
+
+    def test_oral_append_expands_full_google_sheet_before_write(self):
+        class FakeRequest:
+            def __init__(self, result):
+                self.result = result
+
+            def execute(self):
+                return self.result
+
+        class FakeSpreadsheets:
+            def __init__(self):
+                self.batch_update_calls = []
+
+            def get(self, **_kwargs):
+                return FakeRequest({
+                    "sheets": [{
+                        "properties": {
+                            "sheetId": 7,
+                            "gridProperties": {"rowCount": 20},
+                        }
+                    }]
+                })
+
+            def batchUpdate(self, **kwargs):
+                self.batch_update_calls.append(kwargs)
+                return FakeRequest({})
+
+        class FakeService:
+            def __init__(self):
+                self.api = FakeSpreadsheets()
+
+            def spreadsheets(self):
+                return self.api
+
+        service = FakeService()
+
+        added = ensure_sheet_row_capacity(
+            service,
+            "spreadsheet123",
+            sheet_id=7,
+            required_row=21,
+        )
+
+        self.assertEqual(added, 100)
+        request = service.api.batch_update_calls[0]
+        self.assertEqual(request["spreadsheetId"], "spreadsheet123")
+        self.assertEqual(
+            request["body"]["requests"][0]["appendDimension"],
+            {
+                "sheetId": 7,
+                "dimension": "ROWS",
+                "length": 100,
+            },
+        )
+
+    def test_existing_oral_task_is_not_appended_again(self):
+        file_name = "AliceMARKER-0911-7-oral title.mp4"
+        rows = [{
+            "row": 8,
+            "task_date": "2026-09-11",
+            "requester": "Alice",
+            "chinese": "oral title",
+            "creator": "operator",
+            "video_type": ORAL_SHORT_VIDEO_TYPE,
+            "completed_at": "2026-09-11",
+            "review_status": "",
+            "product_link": (
+                '=HYPERLINK("https://drive.google.com/file/d/old/view";'
+                f'"{file_name}")'
+            ),
+            "requester_key": "alice",
+            "task_text_key": "oraltitle",
+            "task_filename_key": "oraltitle",
+        }]
+        records = [{
+            "name": "[SHANA]" + file_name,
+            "webViewLink": "https://drive.google.com/file/d/old/view",
+            "local_is_oral": True,
+            "local_video_duration_millis": 30_000,
+        }]
+        already_submitted = []
+        failures = []
+
+        updates, matched = build_task_sheet_updates(
+            {
+                "task_submission_creator": "operator",
+                "task_submission_creator_marker": "MARKER",
+            },
+            records,
+            rows,
+            "Tasks",
+            {
+                "requester": 2,
+                "chinese": 4,
+                "creator": 9,
+                "video_type": 10,
+                "completed_at": 11,
+                "product_link": 13,
+                "review_status": 14,
+            },
+            failed_files=failures,
+            already_submitted_files=already_submitted,
+        )
+
+        self.assertEqual(updates, [])
+        self.assertEqual(matched, [])
+        self.assertEqual(already_submitted, ["[SHANA]" + file_name])
+        self.assertEqual(failures, [])
+
+    def test_existing_oral_task_with_new_link_replaces_product_link(self):
+        file_name = "AliceMARKER-0911-7-oral title.mp4"
+        rows = [{
+            "row": 8,
+            "task_date": "2026-09-11",
+            "requester": "Alice",
+            "chinese": "oral title",
+            "creator": "operator",
+            "video_type": ORAL_SHORT_VIDEO_TYPE,
+            "completed_at": "2026-09-11",
+            "review_status": "",
+            "product_link": (
+                '=HYPERLINK("https://drive.google.com/file/d/old/view",'
+                f'"{file_name}")'
+            ),
+            "requester_key": "alice",
+            "task_text_key": "oraltitle",
+            "task_filename_key": "oraltitle",
+        }]
+        records = [{
+            "name": "[SHANA]" + file_name,
+            "webViewLink": "https://drive.google.com/file/d/new/view",
+            "local_is_oral": True,
+            "local_video_duration_millis": 60_001,
+        }]
+
+        updates, matched = build_task_sheet_updates(
+            {
+                "task_submission_creator": "operator",
+                "task_submission_creator_marker": "MARKER",
+            },
+            records,
+            rows,
+            "Tasks",
+            {
+                "requester": 2,
+                "chinese": 4,
+                "creator": 9,
+                "video_type": 10,
+                "completed_at": 11,
+                "product_link": 13,
+                "review_status": 14,
+            },
+        )
+
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["operation"], "replace_oral")
+        self.assertEqual(matched[0]["row"], 8)
+        ranges = {item["range"]: item["values"][0][0] for item in updates}
+        self.assertEqual(ranges["'Tasks'!J8"], ORAL_LONG_VIDEO_TYPE)
+        self.assertIn("/new/view", ranges["'Tasks'!M8"])
+
+    def test_link_only_result_resolves_drive_name_for_oral_dedupe(self):
+        service = MagicMock()
+        service.files.return_value.get.return_value.execute.return_value = {
+            "id": "old123",
+            "name": "AliceMARKER-0911-7-oral title.mp4",
+            "mimeType": "video/mp4",
+        }
+        rows = [{
+            "row": 8,
+            "product_link": "https://drive.google.com/file/d/old123/view",
+        }]
+
+        resolved = populate_link_only_product_file_names(rows, service)
+
+        self.assertEqual(resolved, 1)
+        self.assertEqual(
+            rows[0]["product_file_name"],
+            "AliceMARKER-0911-7-oral title.mp4",
+        )
+        service.files.return_value.get.assert_called_once_with(
+            fileId="old123",
+            fields="id,name,mimeType",
+            supportsAllDrives=True,
+        )
+
+    def test_url_used_as_hyperlink_title_is_still_link_only(self):
+        link = "https://drive.google.com/file/d/old123/view"
+        self.assertEqual(extract_product_file_name(link), "")
+        self.assertEqual(
+            extract_product_file_name(f'=HYPERLINK("{link}","{link}")'),
+            "",
+        )
+
+    def test_resolved_link_only_name_prevents_duplicate_append(self):
+        file_name = "AliceMARKER-0911-7-oral title.mp4"
+        rows = [{
+            "row": 8,
+            "task_date": "",
+            "requester": "",
+            "chinese": "",
+            "creator": "",
+            "video_type": "",
+            "completed_at": "",
+            "review_status": "",
+            "product_link": "https://drive.google.com/file/d/old123/view",
+            "product_file_name": file_name,
+            "requester_key": "",
+            "task_text_key": "",
+            "task_filename_key": "",
+        }]
+        records = [{
+            "name": file_name,
+            "webViewLink": "https://drive.google.com/file/d/new456/view",
+            "local_is_oral": True,
+            "local_video_duration_millis": 30_000,
+        }]
+        already_submitted = []
+
+        updates, matched = build_task_sheet_updates(
+            {
+                "task_submission_creator": "operator",
+                "task_submission_creator_marker": "MARKER",
+            },
+            records,
+            rows,
+            "Tasks",
+            {
+                "requester": 2,
+                "chinese": 4,
+                "creator": 9,
+                "video_type": 10,
+                "completed_at": 11,
+                "product_link": 13,
+                "review_status": 14,
+            },
+            already_submitted_files=already_submitted,
+        )
+
+        self.assertTrue(updates)
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["operation"], "replace_oral")
+        self.assertEqual(matched[0]["row"], 8)
+        self.assertEqual(already_submitted, [])
+
+    def test_oral_dedupe_does_not_merge_different_display_names(self):
+        rows = [{
+            "row": 8,
+            "task_date": "2026-09-11",
+            "requester": "Alice",
+            "chinese": "first result",
+            "creator": "operator",
+            "video_type": ORAL_SHORT_VIDEO_TYPE,
+            "completed_at": "2026-09-11",
+            "review_status": "",
+            "product_link": (
+                '=HYPERLINK("https://drive.google.com/file/d/old/view",'
+                '"AliceMARKER-0911-7-first.mp4")'
+            ),
+            "requester_key": "alice",
+            "task_text_key": "firstresult",
+            "task_filename_key": "firstresult",
+        }]
+        records = [{
+            "name": "AliceMARKER-0911-7-second.mp4",
+            "webViewLink": "https://drive.google.com/file/d/new/view",
+            "local_is_oral": True,
+            "local_video_duration_millis": 30_000,
+        }]
+
+        _updates, matched = build_task_sheet_updates(
+            {
+                "task_submission_creator": "operator",
+                "task_submission_creator_marker": "MARKER",
+            },
+            records,
+            rows,
+            "Tasks",
+            {
+                "requester": 2,
+                "chinese": 4,
+                "creator": 9,
+                "video_type": 10,
+                "completed_at": 11,
+                "product_link": 13,
+                "review_status": 14,
+            },
+        )
+
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["row"], 9)
+
+    def test_oral_duration_boundary_uses_short_type(self):
+        self.assertEqual(
+            oral_video_type_for_record({"local_video_duration_millis": 60_000}),
+            ORAL_SHORT_VIDEO_TYPE,
+        )
+        self.assertEqual(
+            oral_video_type_for_record({"local_video_duration_millis": 60_001}),
+            ORAL_LONG_VIDEO_TYPE,
+        )
+        self.assertIsNone(oral_video_type_for_record({}))
+
 
 class TaskResultDetectionChoiceTests(unittest.TestCase):
+    def test_compressed_filename_limit_is_explicit_and_old_default_is_unchanged(self):
+        source = Path("customer-" + "very-long-title-" * 12 + ".mp4")
+
+        old_name = make_compressed_file_name(source, "[SHANA]")
+        limited_name = make_compressed_file_name(
+            source,
+            "[SHANA]",
+            max_length=50,
+        )
+
+        self.assertGreater(len(old_name), 50)
+        self.assertLessEqual(len(limited_name), 50)
+        self.assertTrue(limited_name.endswith(".mp4"))
+
+    def test_output_filename_defaults_to_fifty_and_overwrites_same_prefix(self):
+        task = SimpleNamespace(
+            task_id="7",
+            admin="Alice",
+            creator="Operator",
+            task_date="0914",
+            task_name="A very long customer title " + "word " * 20,
+            task_type="video",
+        )
+        profile = {
+            "output_name_template": (
+                "{admin}MARKER-{mm}{dd}-{task_id}-{task_name}.mp4"
+            )
+        }
+        first = output_name(task, date(2026, 9, 14), {}, profile)
+        task.task_name += "different"
+        second = output_name(task, date(2026, 9, 14), {}, profile)
+
+        self.assertLessEqual(len(first), 50)
+        self.assertTrue(first.endswith(".mp4"))
+        self.assertEqual(first, second)
+        self.assertNotIn("~", first)
+        self.assertGreater(
+            len(legacy_output_name(task, date(2026, 9, 14), {}, profile)),
+            50,
+        )
+        self.assertEqual(
+            limit_output_filename("unchanged.mp4", 50), "unchanged.mp4"
+        )
+
+    def test_existing_legacy_long_output_is_reused_without_new_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root_dir = Path(directory)
+            task_dir = root_dir / "task" / "7"
+            task_dir.mkdir(parents=True)
+            source = task_dir / "final.mp4"
+            source.write_bytes(b"video")
+            output_dir = root_dir / "result"
+            output_dir.mkdir()
+            task = SimpleNamespace(
+                task_id="7",
+                admin="Alice",
+                creator="Operator",
+                task_date="0914",
+                task_name="long title " * 12,
+                task_type="video",
+            )
+            profile = {
+                "mode": "single",
+                "task_dir": "task",
+                "candidate_names": ["final.mp4"],
+                "output_name_template": "{admin}MARKER-0914-{task_id}-{task_name}.mp4",
+            }
+            config = {"task_output_filename_max_length": 50}
+            old_name = legacy_output_name(
+                task, date(2026, 9, 14), config, profile
+            )
+            old_path = output_dir / old_name
+            old_path.write_bytes(b"video")
+            remembered = []
+
+            updated = export_task(
+                task,
+                date(2026, 9, 14),
+                root_dir,
+                output_dir,
+                root_dir / "result-wsp",
+                profile,
+                config,
+                False,
+                exported_file_callback=(
+                    lambda path, _task: remembered.append(path)
+                ),
+            )
+
+            self.assertEqual(updated, [])
+            self.assertEqual(remembered, [old_path])
+            self.assertFalse(
+                (output_dir / output_name(
+                    task, date(2026, 9, 14), config, profile
+                )).exists()
+            )
+
     def test_subcategory_path_normalization(self):
         self.assertEqual(
             normalize_subcategory_path(r" 类别A\\大/../特殊:类别 "),
@@ -1156,6 +2590,8 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
         task = SimpleNamespace(
             task_type="short-video",
             task_type_from_table=True,
+            submission_task_type="client-video-type",
+            submission_task_type_from_table=True,
             review_required=False,
             source_row=7,
         )
@@ -1171,15 +2607,59 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
         records = [{"local_file": str(batches[0][1][0])}]
         attach_local_task_metadata(records, upload_tasks)
 
-        self.assertEqual(records[0]["local_task_type"], "short-video")
+        self.assertEqual(records[0]["local_task_type"], "client-video-type")
         self.assertIs(records[0]["review_required_override"], False)
         self.assertEqual(records[0]["local_task_row"], 7)
 
-    def test_default_task_type_is_not_attached_for_google_writeback(self):
+    def test_oral_source_directory_marks_record_and_keeps_duration(self):
+        video = Path("result/oral.mp4")
+        task = SimpleNamespace(
+            task_type="custom-oral",
+            submission_task_type="",
+            submission_task_type_from_table=False,
+            review_required=None,
+            source_row=9,
+            admin="Alice",
+            task_name="oral task",
+            task_id="7",
+            task_date="2026-09-11",
+        )
+        records = [{"local_file": str(video)}]
+        config = {
+            "task_export_profiles": {
+                "custom-oral": {"task_dir": "口播"},
+            },
+        }
+
+        self.assertTrue(task_uses_oral_source_dir(task, config))
+        with patch(
+            "model.TaskResultOrganizer.local_video_duration_millis",
+            return_value=61_250,
+        ) as duration_reader:
+            attach_local_task_metadata(
+                records,
+                {file_identity(video): task},
+                config,
+            )
+
+        duration_reader.assert_called_once_with(video, config)
+        self.assertTrue(records[0]["local_is_oral"])
+        self.assertEqual(records[0]["local_video_duration_millis"], 61_250)
+        self.assertEqual(records[0]["local_task_date"], "2026-09-11")
+
+    def test_profile_name_alone_does_not_mark_non_oral_source_directory(self):
+        task = SimpleNamespace(task_type="口播")
+        config = {"task_export_profiles": {"口播": {"task_dir": "reels"}}}
+
+        self.assertFalse(task_uses_oral_source_dir(task, config))
+
+    def test_routing_type_is_not_attached_when_submission_type_is_blank(self):
         video = Path("result/default-type.mp4")
         task = SimpleNamespace(
             task_type="reels",
-            task_type_from_table=False,
+            task_type_from_table=True,
+            submission_task_type="",
+            submission_task_type_from_table=False,
             review_required=None,
             source_row=8,
         )
@@ -1189,6 +2669,136 @@ class TaskResultDetectionChoiceTests(unittest.TestCase):
 
         self.assertNotIn("local_task_type", records[0])
         self.assertEqual(records[0]["local_task_row"], 8)
+
+
+class DailyLinkHistoryTests(unittest.TestCase):
+    def test_history_merges_batches_and_replaces_same_slot(self):
+        now = datetime.now().replace(microsecond=0)
+        history, count = record_daily_person_links(
+            {},
+            now.date(),
+            "01",
+            {"Alice": "https://example.test/alice-1"},
+            now=now,
+        )
+        self.assertEqual(count, 1)
+
+        history, count = record_daily_person_links(
+            history,
+            now.date(),
+            "02",
+            {
+                "Alice": "https://example.test/alice-2",
+                "Bob": "https://example.test/bob-2",
+            },
+            now=now,
+        )
+        self.assertEqual(count, 2)
+        history, _ = record_daily_person_links(
+            history,
+            now.date(),
+            "01",
+            {"Alice": "https://example.test/alice-new"},
+            now=now,
+        )
+
+        day_key = now.date().isoformat()
+        self.assertEqual(daily_link_counts(history, day_key), (2, 3))
+        self.assertEqual(
+            history[day_key]["people"]["Alice"]["01"]["link"],
+            "https://example.test/alice-new",
+        )
+
+    def test_history_keeps_seven_calendar_days(self):
+        today = date.today()
+        raw = {}
+        for offset in range(9):
+            day_key = (today - timedelta(days=offset)).isoformat()
+            raw[day_key] = {
+                "people": {
+                    "Alice": {
+                        "01": {"link": f"https://example.test/{offset}"},
+                    }
+                }
+            }
+
+        normalized = normalize_daily_link_history(raw, today=today)
+
+        self.assertEqual(len(normalized), 7)
+        self.assertIn(today.isoformat(), normalized)
+        self.assertIn((today - timedelta(days=6)).isoformat(), normalized)
+        self.assertNotIn((today - timedelta(days=7)).isoformat(), normalized)
+
+    def test_daily_copy_text_is_grouped_by_person(self):
+        now = datetime.now().replace(microsecond=0)
+        history, _ = record_daily_person_links(
+            {},
+            now.date(),
+            "02",
+            {
+                "Alice": "https://example.test/alice",
+                "Bob": "https://example.test/bob",
+            },
+            now=now,
+        )
+
+        text = format_daily_links(history, now.date().isoformat())
+
+        self.assertIn(now.strftime("%Y年%m月%d日"), text)
+        self.assertIn("Alice：\n批次 02：https://example.test/alice", text)
+        self.assertIn("Bob：\n批次 02：https://example.test/bob", text)
+
+    def test_task_sheet_failures_are_saved_and_later_success_resolves_them(self):
+        now = datetime.now().replace(microsecond=0)
+        failure = {
+            "file_name": "AliceMARKER-0904-1-title.mp4",
+            "reason": "没有找到匹配行",
+        }
+        history, count = update_daily_task_sheet_results(
+            {},
+            now.date(),
+            "01",
+            [failure],
+            now=now,
+        )
+
+        day_key = now.date().isoformat()
+        self.assertEqual(count, 1)
+        self.assertEqual(daily_task_sheet_failure_count(history, day_key), 1)
+        self.assertEqual(
+            daily_task_sheet_failures(history, day_key)[0]["reason"],
+            "没有找到匹配行",
+        )
+
+        history, count = update_daily_task_sheet_results(
+            history,
+            now.date(),
+            "02",
+            [],
+            successful_files=[failure["file_name"]],
+            now=now,
+        )
+
+        self.assertEqual(count, 0)
+        self.assertEqual(daily_task_sheet_failure_count(history, day_key), 0)
+
+    def test_missing_submission_sheet_url_reports_video_name(self):
+        report = {}
+        file_name = "AliceMARKER-0904-1-title.mp4"
+
+        count = write_task_submission_links(
+            {
+                "task_submission_sheet_enabled": True,
+                "task_submission_sheet_url": "",
+            },
+            [{"name": file_name}],
+            result_report=report,
+        )
+
+        self.assertEqual(count, 0)
+        self.assertTrue(report["attempted"])
+        self.assertEqual(report["failed_files"][0]["file_name"], file_name)
+        self.assertIn("表格链接", report["failed_files"][0]["reason"])
 
 
 if __name__ == "__main__":

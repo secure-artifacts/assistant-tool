@@ -23,6 +23,10 @@ class _TemplateValues(dict):
         return ""
 
 
+DEFAULT_OUTPUT_FILENAME_MAX_LENGTH = 50
+MIN_OUTPUT_FILENAME_MAX_LENGTH = 12
+
+
 def folder_name(task_date: date) -> str:
     return f"{task_date.month:02d}{task_date.day:02d}"
 
@@ -98,7 +102,41 @@ def first_existing_file(task_dir: Path, names: List[str]) -> Optional[Path]:
     return None
 
 
-def output_name(task, task_date: date, config: Dict, profile=None, index=None) -> str:
+def output_filename_max_length(config: Optional[Dict] = None) -> int:
+    """Return 0 for unlimited, otherwise a safe total filename length."""
+    try:
+        value = int(
+            (config or {}).get(
+                "task_output_filename_max_length",
+                DEFAULT_OUTPUT_FILENAME_MAX_LENGTH,
+            )
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_OUTPUT_FILENAME_MAX_LENGTH
+    if value <= 0:
+        return 0
+    return max(MIN_OUTPUT_FILENAME_MAX_LENGTH, min(255, value))
+
+
+def limit_output_filename(file_name: str, max_length: int) -> str:
+    """Shorten only the last path component and preserve its extension."""
+    value = str(file_name or "")
+    if not value or max_length <= 0:
+        return value
+    path = Path(value)
+    name = path.name
+    if len(name) <= max_length:
+        return value
+    suffix = path.suffix
+    stem_length = max(1, max_length - len(suffix))
+    limited_name = f"{path.stem[:stem_length]}{suffix}"
+    parent = path.parent
+    return limited_name if str(parent) in {"", "."} else str(parent / limited_name)
+
+
+def legacy_output_name(
+    task, task_date: date, config: Dict, profile=None, index=None
+) -> str:
     profile = profile if isinstance(profile, dict) else {}
     template = (
         profile.get("output_name_template")
@@ -106,6 +144,25 @@ def output_name(task, task_date: date, config: Dict, profile=None, index=None) -
         or "{task_id}-{task_name}.mp4"
     )
     return render_template(template, task, task_date, index=index)
+
+
+def output_name(task, task_date: date, config: Dict, profile=None, index=None) -> str:
+    original = legacy_output_name(task, task_date, config, profile, index)
+    return limit_output_filename(original, output_filename_max_length(config))
+
+
+def compatible_output_path(directory: Path, current_name: str, legacy_name: str) -> Path:
+    """Keep using an existing pre-limit file so old work is not re-exported."""
+    directory = Path(directory)
+    current_path = directory / current_name
+    legacy_path = directory / legacy_name
+    if (
+        current_path != legacy_path
+        and not current_path.exists()
+        and legacy_path.exists()
+    ):
+        return legacy_path
+    return current_path
 
 
 def export_task(
@@ -138,7 +195,9 @@ def export_task(
         result_file = first_existing_file(task_dir, candidate_names)
         updated = []
         if result_file:
-            dst = output_dir / output_name(task, task_date, config, profile)
+            legacy_name = legacy_output_name(task, task_date, config, profile)
+            current_name = output_name(task, task_date, config, profile)
+            dst = compatible_output_path(output_dir, current_name, legacy_name)
             if copy_if_updated(result_file, dst):
                 updated.append(dst)
             remember_output(dst)
@@ -147,7 +206,11 @@ def export_task(
         if wsp_export and wsp_name:
             wsp_file = task_dir / render_template(wsp_name, task, task_date)
             if wsp_file.exists():
-                dst = output_dir_wsp / output_name(task, task_date, config, profile)
+                legacy_name = legacy_output_name(task, task_date, config, profile)
+                current_name = output_name(task, task_date, config, profile)
+                dst = compatible_output_path(
+                    output_dir_wsp, current_name, legacy_name
+                )
                 if copy_if_updated(wsp_file, dst):
                     updated.append(dst)
                 remember_output(dst)
@@ -158,13 +221,17 @@ def export_task(
             return []
         updated = []
         for index, video_file in enumerate(task_dir.rglob("*.mp4"), start=1):
-            dst = output_dir / output_name(
+            legacy_name = legacy_output_name(
                 task,
                 task_date,
                 config,
                 profile,
                 index=index,
             )
+            current_name = output_name(
+                task, task_date, config, profile, index=index
+            )
+            dst = compatible_output_path(output_dir, current_name, legacy_name)
             if copy_if_updated(video_file, dst):
                 updated.append(dst)
             remember_output(dst)

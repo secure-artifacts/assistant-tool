@@ -16,6 +16,7 @@ FIELD_ORDER = (
     "creator",
     "task_name",
     "task_type",
+    "submission_task_type",
     "task_date",
     "task_reference_link",
     "task_audio_text",
@@ -37,9 +38,10 @@ SUBMISSION_REQUIRED_FIELDS = (
     "product_link",
 )
 
-SUBMISSION_OPTIONAL_FIELDS = ("video_type",)
+SUBMISSION_OPTIONAL_FIELDS = ("task_date", "video_type")
 
 SUBMISSION_FIELD_ORDER = (
+    "task_date",
     "requester",
     "chinese",
     "video_type",
@@ -54,7 +56,7 @@ SUBMISSION_FIELD_LABELS = {
 }
 
 DEFAULT_TASK_TABLE_SCHEMA = {
-    "version": 1,
+    "version": 2,
     "sheet_name": "",
     "sheet_index": 0,
     "header_row": 0,
@@ -66,6 +68,7 @@ DEFAULT_TASK_TABLE_SCHEMA = {
         "creator": {"aliases": [], "default": ""},
         "task_name": {"aliases": [], "default": "{task_id}"},
         "task_type": {"aliases": [], "default": ""},
+        "submission_task_type": {"aliases": [], "default": ""},
         "task_date": {"aliases": [], "default": ""},
         "task_reference_link": {"aliases": [], "default": ""},
         "task_audio_text": {"aliases": [], "default": ""},

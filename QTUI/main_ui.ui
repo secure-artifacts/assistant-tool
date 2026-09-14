@@ -13,13 +13,55 @@
   <property name="windowTitle">
    <string>做视频辅助工具</string>
   </property>
-  <layout class="QGridLayout" name="gridLayout">
+  <layout class="QGridLayout" name="gridLayout" columnstretch="1,0,0">
    <item row="1" column="0">
-    <widget class="QLabel" name="label_4">
-     <property name="text">
-      <string>任务列表：</string>
-     </property>
-    </widget>
+    <layout class="QHBoxLayout" name="task_list_header_layout">
+     <item>
+      <widget class="QLabel" name="label_4">
+       <property name="text">
+        <string>任务列表：</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="task_list_header_spacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QToolButton" name="task_directory_toggle_btn">
+       <property name="toolTip">
+        <string>展开或收起任务目录</string>
+       </property>
+       <property name="text">
+        <string>任务目录</string>
+       </property>
+       <property name="checkable">
+        <bool>true</bool>
+       </property>
+       <property name="checked">
+        <bool>false</bool>
+       </property>
+       <property name="arrowType">
+        <enum>Qt::RightArrow</enum>
+       </property>
+       <property name="toolButtonStyle">
+        <enum>Qt::ToolButtonTextBesideIcon</enum>
+       </property>
+       <property name="autoRaise">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </item>
    <item row="4" column="0" colspan="3">
     <widget class="QTextEdit" name="log_text_edit"/>
@@ -72,35 +114,14 @@
         </widget>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="horizontalLayout_4">
+        <layout class="QHBoxLayout" name="audio_generation_layout">
          <item>
-          <widget class="QPushButton" name="split_audio_btn">
+          <widget class="QLabel" name="audio_generation_label">
            <property name="text">
-            <string>切分音频</string>
+            <string>音频：</string>
            </property>
           </widget>
          </item>
-         <item>
-          <widget class="QLabel" name="label_7">
-           <property name="text">
-            <string>时长：</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QSpinBox" name="split_len_sbox">
-           <property name="minimum">
-            <number>10</number>
-           </property>
-           <property name="value">
-            <number>30</number>
-           </property>
-          </widget>
-         </item>
-        </layout>
-       </item>
-       <item>
-        <layout class="QHBoxLayout" name="horizontalLayout_3">
          <item>
           <widget class="QPushButton" name="gen_audio_btn">
            <property name="enabled">
@@ -108,6 +129,43 @@
            </property>
            <property name="text">
             <string>生成音频</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="audio_use_task_name_checkbox">
+           <property name="toolTip">
+            <string>启用后使用任务名称生成音频；此选项不会联动“生成字幕”功能。</string>
+           </property>
+           <property name="text">
+            <string>使用任务名</string>
+           </property>
+           <property name="checked">
+            <bool>false</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="audio_generation_spacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="subtitle_generation_action_layout">
+         <item>
+          <widget class="QLabel" name="subtitle_generation_label">
+           <property name="text">
+            <string>字幕：</string>
            </property>
           </widget>
          </item>
@@ -127,6 +185,19 @@
             <bool>false</bool>
            </property>
           </widget>
+         </item>
+         <item>
+          <spacer name="subtitle_generation_spacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
          </item>
         </layout>
        </item>
@@ -161,6 +232,19 @@
            </property>
           </widget>
          </item>
+         <item>
+          <spacer name="subtitle_word_options_spacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
         </layout>
        </item>
        <item>
@@ -194,17 +278,20 @@
            </property>
           </widget>
          </item>
+         <item>
+          <spacer name="subtitle_gap_options_spacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
         </layout>
-       </item>
-       <item>
-        <widget class="QPushButton" name="gen_audio_btn2">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="text">
-          <string>生成音频2</string>
-         </property>
-        </widget>
        </item>
        <item>
         <layout class="QHBoxLayout" name="chrome_buttons_layout">
@@ -424,28 +511,6 @@ p, li { white-space: pre-wrap; }
      </property>
      <property name="selectionMode">
       <enum>QAbstractItemView::ExtendedSelection</enum>
-     </property>
-    </widget>
-   </item>
-   <item row="1" column="1">
-    <widget class="QToolButton" name="task_directory_toggle_btn">
-     <property name="text">
-      <string>任务目录</string>
-     </property>
-     <property name="checkable">
-      <bool>true</bool>
-     </property>
-     <property name="checked">
-      <bool>false</bool>
-     </property>
-     <property name="arrowType">
-      <enum>Qt::RightArrow</enum>
-     </property>
-     <property name="toolButtonStyle">
-      <enum>Qt::ToolButtonTextBesideIcon</enum>
-     </property>
-     <property name="autoRaise">
-      <bool>true</bool>
      </property>
     </widget>
    </item>

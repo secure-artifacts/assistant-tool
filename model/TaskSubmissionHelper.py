@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from app_paths import APP_ROOT
+from model.GoogleDriveDownloader import DownloadError, parse_drive_link
+from model.GoogleDriveHelper import load_drive_service
 from model.GoogleSheetsHelper import (
     config_bool,
     config_str,
@@ -37,6 +39,12 @@ DEFAULT_TASK_SHEET_URL = ""
 DEFAULT_AUDIT_LOG_FILE = APP_ROOT / "TaskSubmissionLog.jsonl"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 TASK_TITLE_MAX_LENGTH = 100
+ORAL_SHORT_VIDEO_TYPE = "口播视频-Flow【1分钟以内】"
+ORAL_LONG_VIDEO_TYPE = "口播视频-Flow【2-3分钟】"
+ORAL_SHORT_MAX_DURATION_MILLIS = 60_000
+TASK_SHEET_ROW_GROWTH = 100
+
+
 def column_letter(index: int) -> str:
     if index < 1:
         raise ValueError("Google 表格列号必须大于 0")
@@ -145,6 +153,23 @@ def record_file_name(record: Dict) -> str:
     return Path(str(record.get("local_file") or "")).name
 
 
+def task_sheet_failure_entry(record: Dict, reason: str) -> Dict:
+    return {
+        "file_name": record_file_name(record),
+        "reason": str(reason or "").strip(),
+    }
+
+
+def task_sheet_failures_for_records(records: List[Dict], reason: str) -> List[Dict]:
+    failures = []
+    for record in records:
+        file_name = record_file_name(record)
+        if Path(file_name).suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        failures.append(task_sheet_failure_entry(record, reason))
+    return failures
+
+
 def record_needs_review(record: Dict, review_folder_name: str) -> bool:
     folder_key = normalize_match_text(Path(str(review_folder_name or "review")).name)
     for field in ("relative_path", "remote_prefix"):
@@ -163,10 +188,61 @@ def extract_product_file_name(product_link: str) -> str:
         flags=re.IGNORECASE,
     )
     if match:
-        return match.group(1).replace('""', '"').strip()
+        display_name = match.group(1).replace('""', '"').strip()
+        if re.match(r"^https?://", display_name, flags=re.IGNORECASE):
+            return ""
+        return display_name
     if re.match(r"^https?://", text, flags=re.IGNORECASE):
         return ""
     return text
+
+
+def populate_link_only_product_file_names(
+    rows: List[Dict],
+    drive_service=None,
+) -> int:
+    """Resolve Drive filenames for rows whose result cell contains only a URL."""
+
+    candidates = []
+    for row in rows:
+        product_link = str(row.get("product_link") or "").strip()
+        if not product_link or extract_product_file_name(product_link):
+            continue
+        link = extract_link_text(product_link)
+        try:
+            drive_link = parse_drive_link(link)
+        except (DownloadError, TypeError, ValueError):
+            continue
+        candidates.append((row, drive_link.file_id))
+
+    if not candidates:
+        return 0
+
+    service = drive_service or load_drive_service()
+    names_by_id = {}
+    resolved_count = 0
+    for row, file_id in candidates:
+        if file_id not in names_by_id:
+            try:
+                metadata = service.files().get(
+                    fileId=file_id,
+                    fields="id,name,mimeType",
+                    supportsAllDrives=True,
+                ).execute()
+                names_by_id[file_id] = str(metadata.get("name") or "").strip()
+            except Exception as error:
+                names_by_id[file_id] = ""
+                print(
+                    f"口播查重：第 {row['row']} 行无法读取网盘视频名称 -> "
+                    f"{type(error).__name__}: {error}"
+                )
+        file_name = names_by_id[file_id]
+        if not file_name:
+            continue
+        row["product_file_name"] = file_name
+        resolved_count += 1
+        print(f"口播查重：第 {row['row']} 行网盘视频名称 -> {file_name}")
+    return resolved_count
 
 
 def extract_video_match_info(file_name: str, creator_marker: str) -> Optional[Dict]:
@@ -205,6 +281,46 @@ def extract_video_match_info(file_name: str, creator_marker: str) -> Optional[Di
         "title": title,
         "title_keys": [item for item in title_keys if item],
     }
+
+
+def submission_file_key(file_name: str) -> str:
+    """Use the displayed result filename as the stable submission identity."""
+
+    name = unicodedata.normalize("NFKC", Path(str(file_name or "")).name).strip()
+    if name.upper().startswith("[SHANA]"):
+        name = name[len("[SHANA]") :]
+    return name.strip().casefold()
+
+
+def oral_video_type_for_record(record: Dict) -> Optional[str]:
+    raw_duration = record.get("local_video_duration_millis")
+    try:
+        duration_millis = int(raw_duration)
+    except (TypeError, ValueError):
+        return None
+    if duration_millis < 0:
+        return None
+    if duration_millis <= ORAL_SHORT_MAX_DURATION_MILLIS:
+        return ORAL_SHORT_VIDEO_TYPE
+    return ORAL_LONG_VIDEO_TYPE
+
+
+def completion_date_for_record(record: Dict, fallback: Optional[str] = None) -> str:
+    """Return an explicit historical upload date, otherwise today's date.
+
+    Normal uploads do not set the override and keep the existing behavior.
+    History-based repairs set it to the original upload batch date so a late
+    repair does not make many older videos look as if they were all completed
+    today.
+    """
+
+    raw_value = str(record.get("task_submission_completed_at") or "").strip()
+    if raw_value:
+        try:
+            return date.fromisoformat(raw_value[:10]).strftime("%Y-%m-%d")
+        except ValueError:
+            print(f"任务表忽略无效的历史完成日期：{raw_value}")
+    return str(fallback or date.today().strftime("%Y-%m-%d"))
 
 
 def text_match_score(video_title_key: str, task_text_key: str) -> float:
@@ -262,6 +378,7 @@ def read_task_sheet_rows(
     spreadsheet_id: str,
     sheet_name: str,
     schema=None,
+    include_incomplete: bool = False,
 ) -> Tuple[int, List[Dict], Dict[str, int]]:
     effective_schema = (
         load_task_table_schema()
@@ -304,9 +421,64 @@ def read_task_sheet_rows(
         item["requester_key"] = normalize_match_text(item["requester"])
         item["task_text_key"] = normalize_match_text(item["chinese"])
         item["task_filename_key"] = task_filename_match_key(item["chinese"])
-        if item["requester_key"] and item["task_text_key"]:
+        if include_incomplete or (
+            item["requester_key"] and item["task_text_key"]
+        ):
             rows.append(item)
     return header_row, rows, column_map
+
+
+def ensure_sheet_row_capacity(
+    service,
+    spreadsheet_id: str,
+    sheet_id: int,
+    required_row: int,
+    growth: int = TASK_SHEET_ROW_GROWTH,
+) -> int:
+    """Append enough grid rows before writing beyond a worksheet's current limit."""
+
+    required_row = max(0, int(required_row or 0))
+    if required_row <= 0:
+        return 0
+
+    metadata = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,gridProperties(rowCount)))",
+    ).execute()
+    current_rows = None
+    for item in metadata.get("sheets", []):
+        properties = item.get("properties", {})
+        if int(properties.get("sheetId", -1)) != int(sheet_id):
+            continue
+        current_rows = int(
+            (properties.get("gridProperties") or {}).get("rowCount") or 0
+        )
+        break
+    if current_rows is None:
+        raise RuntimeError(f"找不到任务提交工作表：sheetId={sheet_id}")
+    if current_rows >= required_row:
+        return 0
+
+    added_rows = max(required_row - current_rows, max(1, int(growth or 1)))
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "appendDimension": {
+                        "sheetId": int(sheet_id),
+                        "dimension": "ROWS",
+                        "length": added_rows,
+                    }
+                }
+            ]
+        },
+    ).execute()
+    print(
+        f"任务提交表格行数不足：已从 {current_rows} 行扩展到 "
+        f"{current_rows + added_rows} 行"
+    )
+    return added_rows
 
 
 def find_matching_row(
@@ -374,6 +546,9 @@ def build_task_sheet_updates(
     rows: List[Dict],
     sheet_name: str,
     column_map: Dict[str, int],
+    failed_files: Optional[List[Dict]] = None,
+    already_submitted_files: Optional[List[str]] = None,
+    first_data_row: int = 1,
 ) -> Tuple[List[Dict], List[Dict]]:
     creator = config_str(
         config,
@@ -396,25 +571,270 @@ def build_task_sheet_updates(
     review_folder_name = config_str(config, "review_folder_name", "review") or "review"
 
     rows_by_requester = {}
+    rows_by_number = {}
     for row in rows:
         rows_by_requester.setdefault(row["requester_key"], []).append(row)
+        rows_by_number[int(row["row"])] = row
+
+    submitted_links = {}
+    submitted_file_keys = {}
+    for row in rows:
+        product_link = str(row.get("product_link") or "").strip()
+        if not product_link:
+            continue
+        row_number = int(row["row"])
+        existing_link = extract_link_text(product_link)
+        if existing_link:
+            submitted_links.setdefault(existing_link, row_number)
+        existing_file_name = str(row.get("product_file_name") or "").strip()
+        existing_file_name = existing_file_name or extract_product_file_name(product_link)
+        existing_file_key = submission_file_key(existing_file_name)
+        if existing_file_key:
+            submitted_file_keys.setdefault(existing_file_key, row_number)
 
     updates = []
     matched = []
     used_rows = set()
     today_text = date.today().strftime("%Y-%m-%d")
+    next_append_row = max(
+        [int(row["row"]) for row in rows] + [max(0, int(first_data_row) - 1)]
+    ) + 1
 
     for record in records:
+        completion_date_text = completion_date_for_record(record, today_text)
         file_name = record_file_name(record)
         video_info = extract_video_match_info(file_name, creator_marker)
         if not video_info:
             if Path(file_name).suffix.lower() in VIDEO_SUFFIXES:
-                print(f"任务表跳过：文件名不符合人员+{creator_marker}-日期-序号格式：{file_name}")
+                reason = f"文件名不符合人员+{creator_marker}-日期-序号格式"
+                print(f"任务表跳过：{reason}：{file_name}")
+                if failed_files is not None:
+                    failed_files.append(task_sheet_failure_entry(record, reason))
             continue
 
         link = drive_link_from_record(record)
         if not link:
-            print(f"任务表跳过：上传结果没有访问链接：{file_name}")
+            reason = "上传结果没有访问链接"
+            print(f"任务表跳过：{reason}：{file_name}")
+            if failed_files is not None:
+                failed_files.append(task_sheet_failure_entry(record, reason))
+            continue
+
+        if bool(record.get("local_is_oral")):
+            # The result-link display name already contains the task date and
+            # number.  Treat that visible filename as the primary identity;
+            # use the URL only when an older row has no usable display name.
+            file_key = submission_file_key(file_name)
+            duplicate_row = submitted_file_keys.get(file_key)
+            if duplicate_row is None:
+                duplicate_row = submitted_links.get(link)
+            if duplicate_row is not None:
+                existing_row = rows_by_number.get(int(duplicate_row), {})
+                existing_link = extract_link_text(existing_row.get("product_link"))
+                if existing_link == link:
+                    print(
+                        f"口播任务表跳过重复：第 {duplicate_row} 行已有记录 <- {file_name}"
+                    )
+                    if already_submitted_files is not None:
+                        already_submitted_files.append(file_name)
+                    continue
+
+            oral_video_type = oral_video_type_for_record(record)
+            if not oral_video_type:
+                reason = "无法读取口播视频时长，不能判断短口播或长口播"
+                print(f"任务表未填写：{file_name} -> {reason}")
+                if failed_files is not None:
+                    failed_files.append(task_sheet_failure_entry(record, reason))
+                continue
+            if "video_type" not in column_map:
+                reason = "任务提交表格没有视频类型列，无法追加口播任务"
+                print(f"任务表未填写：{file_name} -> {reason}")
+                if failed_files is not None:
+                    failed_files.append(task_sheet_failure_entry(record, reason))
+                continue
+
+            if duplicate_row is not None:
+                row_number = int(duplicate_row)
+                product_formula = make_hyperlink_formula(link, file_name)
+                needs_review = record_needs_review(record, review_folder_name)
+                planned_creator = str(existing_row.get("creator") or "").strip() or creator
+                planned_completed_at = (
+                    str(existing_row.get("completed_at") or "").strip()
+                    or completion_date_text
+                )
+                planned_review_status = (
+                    review_status
+                    if needs_review
+                    else str(existing_row.get("review_status") or "").strip()
+                )
+                replacement_values = {
+                    "creator": planned_creator,
+                    "completed_at": planned_completed_at,
+                    "review_status": planned_review_status,
+                    "video_type": oral_video_type,
+                    "product_link": product_formula,
+                }
+                for field_name, value in replacement_values.items():
+                    if field_name not in column_map:
+                        continue
+                    updates.append({
+                        "range": sheet_range(
+                            sheet_name,
+                            "{}{}".format(
+                                column_letter(column_map[field_name]),
+                                row_number,
+                            ),
+                        ),
+                        "values": [[value]],
+                    })
+                requester = str(existing_row.get("requester") or "").strip()
+                requester = requester or str(record.get("local_admin") or "").strip()
+                requester = requester or video_info["requester"]
+                existing_chinese = str(existing_row.get("chinese") or "").strip()
+                matched.append({
+                    "operation": "replace_oral",
+                    "row": row_number,
+                    "file_name": file_name,
+                    "requester": requester,
+                    "reason": "口播修改版覆盖任务表中的旧网盘链接",
+                    "match_score": 1.0,
+                    "video_info": {
+                        "task_date": video_info["task_date"],
+                        "task_id": video_info["task_id"],
+                        "title": video_info["title"],
+                    },
+                    "drive": {
+                        "file_id": record.get("id"),
+                        "link": link,
+                        "previous_link": existing_link,
+                        "action": record.get("action"),
+                        "local_file": record.get("local_file"),
+                        "relative_path": record.get("relative_path"),
+                        "remote_prefix": record.get("remote_prefix"),
+                        "needs_review": needs_review,
+                        "review_required_override": record.get("review_required_override"),
+                        "task_type_override": oral_video_type,
+                        "duration_millis": record.get("local_video_duration_millis"),
+                    },
+                    "before": {
+                        "task_date": str(existing_row.get("task_date") or ""),
+                        "requester": str(existing_row.get("requester") or ""),
+                        "chinese": existing_chinese,
+                        "chinese_sha256": task_text_hash(existing_chinese),
+                        "creator": str(existing_row.get("creator") or ""),
+                        "completed_at": str(existing_row.get("completed_at") or ""),
+                        "review_status": str(existing_row.get("review_status") or ""),
+                        "video_type": str(existing_row.get("video_type") or ""),
+                        "product_link": str(existing_row.get("product_link") or ""),
+                    },
+                    "planned_after": {
+                        "task_date": str(existing_row.get("task_date") or ""),
+                        "requester": str(existing_row.get("requester") or ""),
+                        "chinese": existing_chinese,
+                        "creator": planned_creator,
+                        "completed_at": planned_completed_at,
+                        "review_status": planned_review_status,
+                        "video_type": oral_video_type,
+                        "product_link": product_formula,
+                        "drive_link": link,
+                    },
+                })
+                used_rows.add(row_number)
+                submitted_links[link] = row_number
+                submitted_file_keys[file_key] = row_number
+                print(
+                    f"口播任务表替换：第 {row_number} 行 <- {file_name}"
+                )
+                continue
+
+            row_number = next_append_row
+            next_append_row += 1
+            product_formula = make_hyperlink_formula(link, file_name)
+            needs_review = record_needs_review(record, review_folder_name)
+            requester = str(record.get("local_admin") or "").strip()
+            requester = requester or video_info["requester"]
+            task_text = str(record.get("local_task_name") or "").strip()
+            task_text = task_text or video_info["title"]
+            task_date_text = str(record.get("local_task_date") or "").strip()
+            task_date_text = task_date_text or video_info["task_date"]
+            planned_review_status = review_status if needs_review else ""
+            append_values = {
+                "task_date": task_date_text,
+                "requester": requester,
+                "chinese": task_text,
+                "video_type": oral_video_type,
+                "creator": creator,
+                "completed_at": completion_date_text,
+                "review_status": planned_review_status,
+                "product_link": product_formula,
+            }
+            for field_name, value in append_values.items():
+                if field_name not in column_map or value == "":
+                    continue
+                updates.append({
+                    "range": sheet_range(
+                        sheet_name,
+                        "{}{}".format(
+                            column_letter(column_map[field_name]),
+                            row_number,
+                        ),
+                    ),
+                    "values": [[value]],
+                })
+
+            matched.append({
+                "operation": "append_oral",
+                "row": row_number,
+                "file_name": file_name,
+                "requester": requester,
+                "reason": "口播任务追加到表格末行",
+                "match_score": 1.0,
+                "video_info": {
+                    "task_date": video_info["task_date"],
+                    "task_id": video_info["task_id"],
+                    "title": video_info["title"],
+                },
+                "drive": {
+                    "file_id": record.get("id"),
+                    "link": link,
+                    "action": record.get("action"),
+                    "local_file": record.get("local_file"),
+                    "relative_path": record.get("relative_path"),
+                    "remote_prefix": record.get("remote_prefix"),
+                    "needs_review": needs_review,
+                    "review_required_override": record.get("review_required_override"),
+                    "task_type_override": oral_video_type,
+                    "duration_millis": record.get("local_video_duration_millis"),
+                },
+                "before": {
+                    "task_date": "",
+                    "requester": "",
+                    "chinese": "",
+                    "chinese_sha256": task_text_hash(""),
+                    "creator": "",
+                    "completed_at": "",
+                    "review_status": "",
+                    "video_type": "",
+                    "product_link": "",
+                },
+                "planned_after": {
+                    "task_date": task_date_text,
+                    "requester": requester,
+                    "chinese": task_text,
+                    "creator": creator,
+                    "completed_at": completion_date_text,
+                    "review_status": planned_review_status,
+                    "video_type": oral_video_type,
+                    "product_link": product_formula,
+                    "drive_link": link,
+                },
+            })
+            used_rows.add(row_number)
+            submitted_links[link] = row_number
+            submitted_file_keys[file_key] = row_number
+            print(
+                f"口播任务表追加：第 {row_number} 行 <- {file_name}（{oral_video_type}）"
+            )
             continue
 
         row, reason = find_matching_row(
@@ -428,13 +848,17 @@ def build_task_sheet_updates(
         )
         if row is None:
             print(f"任务表未填写：{file_name} -> {reason}")
+            if failed_files is not None:
+                failed_files.append(task_sheet_failure_entry(record, reason))
             continue
 
         row_number = row["row"]
         product_formula = make_hyperlink_formula(link, file_name)
         needs_review = record_needs_review(record, review_folder_name)
         planned_creator = str(row["creator"]).strip() or creator
-        planned_completed_at = str(row["completed_at"]).strip() or today_text
+        planned_completed_at = (
+            str(row["completed_at"]).strip() or completion_date_text
+        )
         planned_review_status = review_status if needs_review else str(row.get("review_status", ""))
         # The Google video-type cell mirrors only the explicit task type from
         # the local registration sheet.  Empty local cells leave Google as-is;
@@ -455,7 +879,7 @@ def build_task_sheet_updates(
                     sheet_name,
                     "{}{}".format(column_letter(column_map["completed_at"]), row_number),
                 ),
-                "values": [[today_text]],
+                "values": [[completion_date_text]],
             })
         if needs_review:
             updates.append({
@@ -490,6 +914,7 @@ def build_task_sheet_updates(
         used_rows.add(row_number)
         match_score = task_row_match_score(video_info, row)
         matched.append({
+            "operation": "update_existing",
             "row": row_number,
             "file_name": file_name,
             "requester": video_info["requester"],
@@ -522,6 +947,9 @@ def build_task_sheet_updates(
                 "product_link": row["product_link"],
             },
             "planned_after": {
+                "task_date": row.get("task_date", ""),
+                "requester": row["requester"],
+                "chinese": row["chinese"],
                 "creator": planned_creator,
                 "completed_at": planned_completed_at,
                 "review_status": planned_review_status,
@@ -598,7 +1026,19 @@ def make_audit_event(
     return event
 
 
-def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
+def write_task_submission_links(
+    config: Dict,
+    records: List[Dict],
+    result_report: Optional[Dict] = None,
+    drive_service=None,
+) -> int:
+    if isinstance(result_report, dict):
+        result_report.clear()
+        result_report.update({
+            "failed_files": [],
+            "successful_files": [],
+            "attempted": False,
+        })
     if not records:
         return 0
     if not config_bool(config, "task_submission_sheet_enabled", True):
@@ -609,28 +1049,54 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
     spreadsheet_id = extract_spreadsheet_id(sheet_url)
     if not spreadsheet_id:
         print("未配置 task_submission_sheet_url，跳过任务提交表格写入。")
+        if isinstance(result_report, dict):
+            result_report["attempted"] = True
+            result_report["failed_files"] = task_sheet_failures_for_records(
+                records,
+                "未配置有效的任务提交表格链接",
+            )
         return 0
+
+    if isinstance(result_report, dict):
+        result_report["attempted"] = True
 
     service = load_sheets_service(config, "task_submission_sheet")
     gid = extract_sheet_gid(sheet_url)
-    sheet_name, _ = get_sheet_info(service, spreadsheet_id, gid)
+    sheet_name, sheet_id = get_sheet_info(service, spreadsheet_id, gid)
     task_schema = load_task_table_schema()
-    _, rows, column_map = read_task_sheet_rows(
+    header_row, rows, column_map = read_task_sheet_rows(
         service,
         spreadsheet_id,
         sheet_name,
         schema=task_schema,
+        include_incomplete=True,
     )
+    if any(bool(record.get("local_is_oral")) for record in records):
+        populate_link_only_product_file_names(rows, drive_service=drive_service)
+    failed_files = []
+    already_submitted_files = []
     updates, matched = build_task_sheet_updates(
         config,
         records,
         rows,
         sheet_name,
         column_map,
+        failed_files=failed_files,
+        already_submitted_files=already_submitted_files,
+        first_data_row=header_row + 1,
     )
+    if isinstance(result_report, dict):
+        result_report["failed_files"] = failed_files
+        result_report["successful_files"] = list(already_submitted_files)
 
     if not matched:
-        print("任务提交表格没有找到可以安全填写的任务。")
+        if already_submitted_files:
+            print(
+                f"任务提交表格已有 {len(already_submitted_files)} 条相同任务，"
+                "已全部跳过重复写入。"
+            )
+        else:
+            print("任务提交表格没有找到可以安全填写的任务。")
         return 0
 
     run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
@@ -642,13 +1108,33 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
             sheet_url,
             sheet_name,
             item,
-            message="已完成唯一匹配，准备写入 Google 表格",
+            message=(
+                "口播任务准备追加到 Google 表格末行"
+                if item.get("operation") == "append_oral"
+                else (
+                    "口播修改版准备替换 Google 表格中的旧链接"
+                    if item.get("operation") == "replace_oral"
+                    else "已完成唯一匹配，准备写入 Google 表格"
+                )
+            ),
         )
         for item in matched
     ]
     log_path = append_audit_events(config, prepared_events)
 
     try:
+        appended_rows = [
+            int(item["row"])
+            for item in matched
+            if item.get("operation") == "append_oral"
+        ]
+        if appended_rows:
+            ensure_sheet_row_capacity(
+                service,
+                spreadsheet_id,
+                sheet_id,
+                max(appended_rows),
+            )
         write_response = service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={
@@ -657,6 +1143,15 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
             },
         ).execute()
     except Exception as exc:
+        write_error = f"Google 表格写入失败：{type(exc).__name__}: {exc}"
+        if isinstance(result_report, dict):
+            result_report["failed_files"].extend(
+                {
+                    "file_name": item["file_name"],
+                    "reason": write_error,
+                }
+                for item in matched
+            )
         failure_events = [
             make_audit_event(
                 run_id,
@@ -688,6 +1183,15 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
             column_map,
         )
     except Exception as exc:
+        verification_error = f"写入后无法校验：{type(exc).__name__}: {exc}"
+        if isinstance(result_report, dict):
+            result_report["failed_files"].extend(
+                {
+                    "file_name": item["file_name"],
+                    "reason": verification_error,
+                }
+                for item in matched
+            )
         unverified_events = [
             make_audit_event(
                 run_id,
@@ -706,16 +1210,35 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
         print(f"任务表已经写入，但读回校验失败：{type(exc).__name__}: {exc}")
     else:
         completed_events = []
+        successful_files = list(already_submitted_files)
+        verification_failures = []
         for item in matched:
             actual = actual_rows.get(item["row"], {})
+            is_append = item.get("operation") == "append_oral"
+            expected_requester = (
+                item["planned_after"]["requester"]
+                if is_append
+                else item["before"]["requester"]
+            )
+            expected_chinese = (
+                item["planned_after"]["chinese"]
+                if is_append
+                else item["before"]["chinese"]
+            )
             checks = {
-                "requester_unchanged": (
+                "requester_correct": (
                     normalize_match_text(actual.get("requester"))
-                    == normalize_match_text(item["before"]["requester"])
+                    == normalize_match_text(expected_requester)
                 ),
-                "task_text_unchanged": (
+                "task_text_correct": (
                     task_text_hash(actual.get("chinese"))
-                    == item["before"]["chinese_sha256"]
+                    == task_text_hash(expected_chinese)
+                ),
+                "task_date_correct": (
+                    "task_date" not in column_map
+                    or not is_append
+                    or normalize_match_text(actual.get("task_date"))
+                    == normalize_match_text(item["planned_after"]["task_date"])
                 ),
                 "creator_correct": (
                     normalize_match_text(actual.get("creator"))
@@ -737,6 +1260,14 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
                 ),
             }
             verified = all(checks.values())
+            if verified:
+                successful_files.append(item["file_name"])
+            else:
+                failed_checks = [name for name, passed in checks.items() if not passed]
+                verification_failures.append({
+                    "file_name": item["file_name"],
+                    "reason": "写入后校验不一致：" + "、".join(failed_checks),
+                })
             completed_events.append(
                 make_audit_event(
                     run_id,
@@ -752,6 +1283,9 @@ def write_task_submission_links(config: Dict, records: List[Dict]) -> int:
                 )
             )
         append_audit_events(config, completed_events)
+        if isinstance(result_report, dict):
+            result_report["successful_files"] = successful_files
+            result_report["failed_files"].extend(verification_failures)
 
     print(f"任务提交表格日志：{log_path}")
     print(f"已填写任务提交表格：{len(matched)} 条")

@@ -291,7 +291,7 @@ def upload_new_file(service, local_file: Path, parent_id: str) -> Dict:
     request = service.files().create(
         body=metadata,
         media_body=media,
-        fields="id,name,md5Checksum,webViewLink,webContentLink",
+        fields="id,name,mimeType,md5Checksum,size,modifiedTime,webViewLink,webContentLink",
         supportsAllDrives=True,
     )
     created = execute_resumable_upload(request, local_file, "开始上传")
@@ -312,7 +312,7 @@ def update_existing_file(service, local_file: Path, remote_file_id: str) -> Dict
     request = service.files().update(
         fileId=remote_file_id,
         media_body=media,
-        fields="id,name,md5Checksum,webViewLink,webContentLink",
+        fields="id,name,mimeType,md5Checksum,size,modifiedTime,webViewLink,webContentLink",
         supportsAllDrives=True,
     )
     updated = execute_resumable_upload(request, local_file, "开始覆盖")

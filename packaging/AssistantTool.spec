@@ -4,6 +4,8 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
+from comtypes.client import GetModule
+
 
 sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
 
@@ -11,6 +13,11 @@ project_root = Path(SPECPATH).parent
 datas = []
 binaries = []
 hiddenimports = []
+
+# Generate and collect the Windows UI Automation wrapper used by the external
+# Flow parameter guard. This avoids trying to create comtypes.gen files beside
+# the installed executable at runtime.
+GetModule("UIAutomationCore.dll")
 
 for package_name in (
     "stable_whisper",
@@ -20,6 +27,7 @@ for package_name in (
     "av",
     "elevenlabs",
     "pycaw",
+    "comtypes",
 ):
     package_datas, package_binaries, package_hiddenimports = collect_all(package_name)
     datas += package_datas
@@ -28,6 +36,8 @@ for package_name in (
 
 hiddenimports += collect_submodules("googleapiclient")
 hiddenimports += collect_submodules("google_auth_oauthlib")
+hiddenimports += collect_submodules("comtypes.gen")
+hiddenimports += collect_submodules("app_plugins")
 
 a = Analysis(
     [str(project_root / "main.py")],

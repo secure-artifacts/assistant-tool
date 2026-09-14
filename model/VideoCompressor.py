@@ -4,6 +4,11 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
+from model.TaskResultExporter import (
+    limit_output_filename,
+    output_filename_max_length,
+)
+
 
 SHANA_PREFIX = "[SHANA]"
 MAX_COMPRESSED_FILE_NAME_LENGTH = 180
@@ -34,7 +39,8 @@ def should_compress(file_path, keywords):
     return False
 
 
-def make_compressed_file_name(src_file, prefix):
+def legacy_compressed_file_name(src_file, prefix):
+    """Return the exact name used before the configurable 50-char limit."""
     src_file = Path(src_file)
     file_name = f"{prefix}{src_file.stem}.mp4"
 
@@ -48,10 +54,29 @@ def make_compressed_file_name(src_file, prefix):
     return short_name
 
 
-def get_compressed_path(src_file, preset_path):
+def make_compressed_file_name(
+    src_file,
+    prefix,
+    max_length=None,
+):
+    if max_length is None:
+        return legacy_compressed_file_name(src_file, prefix)
+    src_file = Path(src_file)
+    file_name = f"{prefix}{src_file.stem}.mp4"
+    limited_name = limit_output_filename(file_name, int(max_length or 0))
+    if limited_name != file_name:
+        print(f"成品文件名超过 {max_length} 个字符，压缩版保存为：{limited_name}")
+    return limited_name
+
+
+def get_compressed_path(src_file, preset_path, max_length=None):
     prefix, _, _, _ = read_shana_preset(preset_path)
     src_file = Path(src_file)
-    return src_file.parent / make_compressed_file_name(src_file, prefix)
+    if max_length is None:
+        return src_file.parent / legacy_compressed_file_name(src_file, prefix)
+    return src_file.parent / make_compressed_file_name(
+        src_file, prefix, max_length=max_length
+    )
 
 
 def compressed_is_new(src_file, dst_file):
@@ -150,7 +175,18 @@ def compress_video(src_file, config):
         print(f"没找到 Shana 预设，上传原文件：{preset_path}")
         return src_file
 
-    dst_file = get_compressed_path(src_file, preset_path)
+    max_length = output_filename_max_length(config)
+    dst_file = get_compressed_path(src_file, preset_path, max_length=max_length)
+    legacy_dst_file = get_compressed_path(src_file, preset_path)
+    if (
+        dst_file != legacy_dst_file
+        and not dst_file.exists()
+        and legacy_dst_file.exists()
+    ):
+        # Continue using an existing compressed artifact from the old naming
+        # rule.  Re-encoding it under a new name would make an unchanged video
+        # look new and upload it again.
+        dst_file = legacy_dst_file
 
     # 不管关键词是否命中，只要已经有最新压缩版，就优先上传压缩版。
     if compressed_is_new(src_file, dst_file):

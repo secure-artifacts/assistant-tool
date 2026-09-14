@@ -14,9 +14,14 @@
 /TaskSubmissionLog.jsonl
 /TaskResultPendingFiles.json
 /GoogleSheetMonitorState.json
+/ReviewSubmissionHistory.json
+/VideoUploadHistory.json
+/VideoUploadHistoryArchives/
 /InventoryState.json
+/MaterialLibrary/
 /TaskReferenceDownloadState.json
 /人脸数据库/
+/logs/
 
 # Legacy layout from versions before the task-result integration refactor
 /model/task_result_organizer/

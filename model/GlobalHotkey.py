@@ -7,6 +7,12 @@ from PyQt5 import QtCore, QtGui
 
 CHROME_NEXT_HOTKEY_CONFIG_KEY = 'chrome_next_global_hotkey'
 DEFAULT_CHROME_NEXT_HOTKEY = 'Ctrl+Alt+N'
+TASK_RESULT_HOTKEY_CONFIG_KEY = 'task_result_global_hotkey'
+DEFAULT_TASK_RESULT_HOTKEY = 'Ctrl+Alt+R'
+LOAD_TASK_HOTKEY_CONFIG_KEY = 'load_task_global_hotkey'
+DEFAULT_LOAD_TASK_HOTKEY = 'Ctrl+Alt+L'
+INVENTORY_MANAGER_HOTKEY_CONFIG_KEY = 'inventory_manager_global_hotkey'
+DEFAULT_INVENTORY_MANAGER_HOTKEY = 'Ctrl+Alt+I'
 
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
@@ -15,6 +21,10 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 HOTKEY_ID = 0xA118
+CHROME_NEXT_HOTKEY_ID = HOTKEY_ID
+TASK_RESULT_HOTKEY_ID = HOTKEY_ID + 1
+LOAD_TASK_HOTKEY_ID = HOTKEY_ID + 2
+INVENTORY_MANAGER_HOTKEY_ID = HOTKEY_ID + 3
 
 
 SPECIAL_KEY_TO_VK = {
@@ -122,15 +132,16 @@ class _NativeHotkeyFilter(QtCore.QAbstractNativeEventFilter):
 class GlobalHotkeyManager(QtCore.QObject):
     activated = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, hotkey_id=HOTKEY_ID):
         super().__init__(parent)
+        self.hotkey_id = int(hotkey_id)
         self.sequence = None
         self.last_error = ''
         self._registered = False
         self._modifiers = None
         self._virtual_key = None
         self._native_filter = _NativeHotkeyFilter(
-            HOTKEY_ID,
+            self.hotkey_id,
             self.activated.emit,
         )
         application = QtCore.QCoreApplication.instance()
@@ -164,7 +175,7 @@ class GlobalHotkeyManager(QtCore.QObject):
         ctypes.set_last_error(0)
         registered = bool(self._user32.RegisterHotKey(
             None,
-            HOTKEY_ID,
+            self.hotkey_id,
             modifiers,
             virtual_key,
         ))
@@ -213,7 +224,7 @@ class GlobalHotkeyManager(QtCore.QObject):
 
     def unregister(self):
         if self._registered and self._user32 is not None:
-            self._user32.UnregisterHotKey(None, HOTKEY_ID)
+            self._user32.UnregisterHotKey(None, self.hotkey_id)
         self.sequence = None
         self._modifiers = None
         self._virtual_key = None

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app_paths import APP_ROOT
+from model.ReviewSubmissionHistory import record_review_submissions
 
 DEFAULT_CREDENTIALS_FILE = APP_ROOT / "GoogleSheetsCredentials.json"
 DEFAULT_TOKEN_FILE = APP_ROOT / "GoogleSheetsToken.json"
@@ -216,6 +217,16 @@ def extract_link_text(value: str) -> str:
         return match.group(1).strip()
     return text
 
+
+def remember_review_submissions(records: List[Dict]) -> None:
+    try:
+        record_review_submissions(records)
+    except (OSError, ValueError, TypeError) as error:
+        # The sheet operation itself has already succeeded.  A local history
+        # write failure must be visible, but must not report the remote write
+        # as failed and tempt the user to submit everything again.
+        print(f"保存审核提交历史失败：{type(error).__name__}: {error}")
+
 def existing_links(values: List[List[str]], link_col: int, header_row: int) -> set:
     result = set()
     for row in values[header_row:]:
@@ -295,6 +306,9 @@ def write_review_video_links(config: Dict, records: List[Dict]) -> int:
     headers = values[header_row - 1] if header_row > 0 and len(values) >= header_row else []
     rows = build_rows(config, records, values, header_row, headers)
     if not rows:
+        # Existing rows are still useful history (for example after the
+        # feature is installed on a machine with earlier submissions).
+        remember_review_submissions(records)
         print("没有新的人工检查链接需要写入表格。")
         return 0
 
@@ -313,5 +327,6 @@ def write_review_video_links(config: Dict, records: List[Dict]) -> int:
         body={"values": rows},
     ).execute()
 
+    remember_review_submissions(records)
     print(f"已写入人工检查表格：{len(rows)} 条")
     return len(rows)

@@ -19,9 +19,6 @@ class Ui_MainSettingDialog(object):
         self.gridLayout.setObjectName("gridLayout")
         self.settingTabWidget = QtWidgets.QTabWidget(MainSettingDialog)
         self.settingTabWidget.setObjectName("settingTabWidget")
-        self.tab = QtWidgets.QWidget()
-        self.tab.setObjectName("tab")
-        self.settingTabWidget.addTab(self.tab, "")
         self.tab_2 = QtWidgets.QWidget()
         self.tab_2.setObjectName("tab_2")
         self.settingTabWidget.addTab(self.tab_2, "")
@@ -111,13 +108,12 @@ class Ui_MainSettingDialog(object):
         self.gridLayout.addLayout(self.horizontalLayout, 1, 0, 1, 1)
 
         self.retranslateUi(MainSettingDialog)
-        self.settingTabWidget.setCurrentIndex(2)
+        self.settingTabWidget.setCurrentIndex(1)
         QtCore.QMetaObject.connectSlotsByName(MainSettingDialog)
 
     def retranslateUi(self, MainSettingDialog):
         _translate = QtCore.QCoreApplication.translate
         MainSettingDialog.setWindowTitle(_translate("MainSettingDialog", "Dialog"))
-        self.settingTabWidget.setTabText(self.settingTabWidget.indexOf(self.tab), _translate("MainSettingDialog", "切分音频设置"))
         self.settingTabWidget.setTabText(self.settingTabWidget.indexOf(self.tab_2), _translate("MainSettingDialog", "分拣视频设置"))
         item = self.tableWidget.horizontalHeaderItem(0)
         item.setText(_translate("MainSettingDialog", "名称"))

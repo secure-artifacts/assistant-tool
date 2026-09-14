@@ -193,10 +193,16 @@ class TaskData:
         self._full_task_name = full_task_name
         self.task_id = self.safe_filename(value("task_id"))
         self.task_type = self.safe_filename(value("task_type"))
+        self.submission_task_type = str(
+            value("submission_task_type") or ""
+        ).strip()
         self.defaulted_fields = set(task_info.get("_defaulted_fields", ()))
         self.task_type_from_table = bool(self.task_type) and (
             "task_type" not in self.defaulted_fields
         )
+        self.submission_task_type_from_table = bool(
+            self.submission_task_type
+        ) and ("submission_task_type" not in self.defaulted_fields)
         self.task_date = str(value("task_date") or "").strip()
         self.task_reference_link = str(
             value("task_reference_link") or ""
@@ -253,6 +259,17 @@ def ReadTaskOds2(doc_path, schema=None, return_report=False):
 
         if not has_source_value:
             continue
+
+        # Backward compatibility: an older registration sheet may have only
+        # the submission type column.  It can still serve as the routing type
+        # when no dedicated routing-type column exists.  When both columns are
+        # present, they remain completely independent.
+        if (
+            not mapped["task_type"]
+            and not columns["task_type"]
+            and mapped["submission_task_type"]
+        ):
+            mapped["task_type"] = mapped["submission_task_type"]
 
         sheet_row_number = physical_index + 1
         data_row_number = physical_index - header_index

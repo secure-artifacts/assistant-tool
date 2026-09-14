@@ -4,6 +4,8 @@ def smart_split_sentences(text):
     if not text:
         return []
 
+    had_terminal_period = text.rstrip().endswith('.')
+
     protected = []
 
     def make_protector(prefix):
@@ -56,9 +58,9 @@ def smart_split_sentences(text):
         sentence = restore(sentence)
         if not sentence:
             continue
-        # 最后一句如果原本没有句号就不加
+        # 保留原文最后的句号；没有句号时也不能擅自添加。
         is_last = (idx == len(sentences) - 1)
-        if not is_last and not sentence.endswith('.'):
+        if (not is_last or had_terminal_period) and not sentence.endswith('.'):
             sentence += '.'
         result.append(sentence)
 

@@ -1,6 +1,6 @@
 import random
 import asyncio
-import math
+import logging
 import os
 import random
 import re
@@ -10,7 +10,6 @@ from pathlib import Path
 import edge_tts
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
-from pydub import AudioSegment, silence
 
 from model.ApiKeyHelper import (
     get_subscription_snapshot,
@@ -23,6 +22,16 @@ from elevenlabs import VoiceSettings
 
 
 # ElevenLabs API key 将由调用方传入，符合单一职责原则
+
+logger = logging.getLogger("assistant_tool.audio")
+
+
+def _emit_progress(progress_callback, message):
+    message = str(message)
+    if progress_callback is None:
+        print(message)
+    else:
+        progress_callback(message)
 
 
 def _mask_api_key(api_key):
@@ -96,16 +105,18 @@ def _classify_api_error(error):
     return 'request', details
 
 
-def _record_status(config_path, api_key, **updates):
+def _record_status(config_path, api_key, progress_callback=None, **updates):
     if not config_path:
         return
     try:
         record_api_key_status(config_path, api_key, **updates)
     except Exception as e:
-        print(f"记录 API Key 状态失败: {e}")
+        logger.warning("记录 API Key 状态失败", exc_info=True)
+        _emit_progress(progress_callback, f"记录 API Key 状态失败: {e}")
 
 
-def _record_quota_exhausted(config_path, api_key, details):
+def _record_quota_exhausted(config_path, api_key, details,
+                            progress_callback=None):
     now = int(time.time())
     reset_unix = 0
     reset_source = 'subscription_api'
@@ -121,7 +132,11 @@ def _record_quota_exhausted(config_path, api_key, details):
         # 如果状态接口临时不可用，隔天只探测一次，避免把 Key 错封一个月。
         reset_unix = now + 24 * 60 * 60
         reset_source = 'fallback_daily_probe'
-        print(f"未能读取精确额度刷新时间，将在 24 小时后探测: {e}")
+        logger.warning("未能读取精确额度刷新时间", exc_info=True)
+        _emit_progress(
+            progress_callback,
+            f"未能读取精确额度刷新时间，将在 24 小时后探测: {e}",
+        )
 
     if reset_unix <= now:
         reset_unix = now + 24 * 60 * 60
@@ -139,12 +154,14 @@ def _record_quota_exhausted(config_path, api_key, details):
         last_error_code=details.get('code') or details.get('status') or 'quota_exceeded',
         last_error_message=details.get('message', ''),
         retry_after_unix=None,
+        progress_callback=progress_callback,
     )
     return reset_unix
 
 
 def _save_audio_with_api_keys(api_keys, filename, convert_audio,
-                              api_key_status_config='config.json'):
+                              api_key_status_config='config.json',
+                              progress_callback=None):
     """依次尝试 Key，并仅在音频完整生成后替换目标文件。"""
     temp_filename = f"{filename}.part"
 
@@ -153,7 +170,8 @@ def _save_audio_with_api_keys(api_keys, filename, convert_audio,
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
 
-            print(
+            _emit_progress(
+                progress_callback,
                 f"正在尝试 ElevenLabs API Key "
                 f"{index}/{len(api_keys)} ({_mask_api_key(api_key)})"
             )
@@ -181,10 +199,16 @@ def _save_audio_with_api_keys(api_keys, filename, convert_audio,
                 reset_unix=None,
                 reset_source=None,
                 retry_after_unix=None,
+                progress_callback=progress_callback,
             )
-            print(f"Audio saved to {filename}")
+            _emit_progress(progress_callback, f"音频已保存：{filename}")
             return True
         except Exception as e:
+            logger.warning(
+                "ElevenLabs 音频生成请求失败（Key %s）",
+                _mask_api_key(api_key),
+                exc_info=True,
+            )
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
 
@@ -193,9 +217,13 @@ def _save_audio_with_api_keys(api_keys, filename, convert_audio,
 
             if error_type == 'quota':
                 reset_unix = _record_quota_exhausted(
-                    api_key_status_config, api_key, details
+                    api_key_status_config,
+                    api_key,
+                    details,
+                    progress_callback=progress_callback,
                 )
-                print(
+                _emit_progress(
+                    progress_callback,
                     f"API Key {_mask_api_key(api_key)} 额度已用完，"
                     f"刷新时间 {time.strftime('%Y-%m-%d %H:%M', time.localtime(reset_unix))}；"
                     f"尝试下一个 Key"
@@ -211,8 +239,10 @@ def _save_audio_with_api_keys(api_keys, filename, convert_audio,
                     last_error_code=details.get('code') or details.get('status') or 'invalid_api_key',
                     last_error_message=details.get('message', ''),
                     retry_after_unix=None,
+                    progress_callback=progress_callback,
                 )
-                print(
+                _emit_progress(
+                    progress_callback,
                     f"API Key {_mask_api_key(api_key)} 无效，已停止后续尝试；"
                     f"尝试下一个 Key"
                 )
@@ -228,8 +258,10 @@ def _save_audio_with_api_keys(api_keys, filename, convert_audio,
                     last_failure_unix=now,
                     last_error_code=details.get('code') or details.get('status') or 'rate_limit',
                     last_error_message=details.get('message', ''),
+                    progress_callback=progress_callback,
                 )
-                print(
+                _emit_progress(
+                    progress_callback,
                     f"API Key {_mask_api_key(api_key)} 暂时限流，冷却 5 分钟；"
                     f"尝试下一个 Key"
                 )
@@ -244,22 +276,27 @@ def _save_audio_with_api_keys(api_keys, filename, convert_audio,
                     last_failure_unix=now,
                     last_error_code=details.get('code') or details.get('status') or 'temporary_error',
                     last_error_message=details.get('message', ''),
+                    progress_callback=progress_callback,
                 )
 
             # 参数、模型、Voice 或服务故障并非换 Key 能解决，避免遍历全部 Key。
-            print(
+            _emit_progress(
+                progress_callback,
                 f"音频生成失败（{_mask_api_key(api_key)}）: {e}；"
                 f"本次不再反复尝试其他 Key"
             )
             break
 
-    print("错误: 没有可用的 ElevenLabs API Key 完成音频生成")
+    _emit_progress(
+        progress_callback,
+        "错误: 没有可用的 ElevenLabs API Key 完成音频生成",
+    )
     return False
 
 
 def CreateAudio(text, filename, voice_id=None, model_id=None, speed=1.0,
                 pitch=1.0, api_key=None, api_keys=None,
-                api_key_status_config='config.json'):
+                api_key_status_config='config.json', progress_callback=None):
     """
     创建 ElevenLabs 语音文件
 
@@ -277,12 +314,12 @@ def CreateAudio(text, filename, voice_id=None, model_id=None, speed=1.0,
     if not keys:
         keys = normalize_api_keys(api_key)
     if not keys:
-        print("错误: 未提供 ElevenLabs API key")
+        _emit_progress(progress_callback, "错误: 未提供 ElevenLabs API key")
         return False
 
     text = smart_split_sentences(text)
     if voice_id is None:
-        print("声音类型未传入")
+        _emit_progress(progress_callback, "声音类型未传入")
         return None
 
     if model_id is None:
@@ -314,6 +351,7 @@ def CreateAudio(text, filename, voice_id=None, model_id=None, speed=1.0,
         filename,
         convert_audio,
         api_key_status_config=api_key_status_config,
+        progress_callback=progress_callback,
     )
 
 
@@ -324,7 +362,8 @@ def CreateAudio3(
         stability: float = 0.35,  # v3: Creative(低)=更有表现力, Robust(高)=更稳定
         api_key: str = None,
         api_keys=None,
-        api_key_status_config='config.json'
+        api_key_status_config='config.json',
+        progress_callback=None,
 ):
     """
     使用 ElevenLabs eleven_v3 模型，自动注入 Audio Tags 实现情感表演。
@@ -340,11 +379,11 @@ def CreateAudio3(
     if not keys:
         keys = normalize_api_keys(api_key)
     if not keys:
-        print("错误: 未提供 ElevenLabs API key")
+        _emit_progress(progress_callback, "错误: 未提供 ElevenLabs API key")
         return False
 
     if voice_id is None:
-        print("声音类型未传入")
+        _emit_progress(progress_callback, "声音类型未传入")
         return None
 
     # v3 的核心参数只有 stability，speed/pitch 已被 tag 系统取代
@@ -369,10 +408,12 @@ def CreateAudio3(
         filename,
         convert_audio,
         api_key_status_config=api_key_status_config,
+        progress_callback=progress_callback,
     )
 
 
-def CreateTTSAudio(text, voice_type, filename, rate="+0%", pitch="+0Hz"):
+def CreateTTSAudio(text, voice_type, filename, rate="+0%", pitch="+0Hz",
+                   progress_callback=None):
     # --- 新增步骤：简单的自动断行 ---
     # 逻辑：找到 . ! ? 以及中文的 。 ！？，在它们后面强制加一个换行符 \n
     # 这样 TTS 读到这里会有一个自然的停顿
@@ -385,7 +426,7 @@ def CreateTTSAudio(text, voice_type, filename, rate="+0%", pitch="+0Hz"):
     }
 
     if voice_type not in voice_id_dict:
-        print("声音类型未传入")
+        _emit_progress(progress_callback, "声音类型未传入")
         return None
 
     # 2. 获取对应的 Voice ID
@@ -400,83 +441,10 @@ def CreateTTSAudio(text, voice_type, filename, rate="+0%", pitch="+0Hz"):
     # 4. 运行异步任务
     try:
         asyncio.run(_generate_audio())
-        print(f"成功生成语音文件: {filename}")
+        _emit_progress(progress_callback, f"成功生成语音文件：{filename}")
+        return True
     except Exception as e:
-        print(f"生成失败: {e}")
-
-
-def mergeSplitPoints(p_list, max_len):
-    if not p_list or len(p_list) < 2:
-        return p_list
-
-    result = [p_list[0]]
-    p_begin = p_list[0]
-    p_end = p_list[1]
-
-    for p in p_list[1:]:
-        # 如果超过最大段长 -> 切一个段
-        if p - p_begin > max_len:
-            result.append(p_end)
-            p_begin = p_end  # 重新开始计算新段起点
-        p_end = p
-
-    # 保证最后一个点也加入
-    if result[-1] != p_list[-1]:
-        result.append(p_list[-1])
-
-    return result
-
-
-def splitAudio(input_file: Path, max_length, ultra_tolerance=None):
-    if ultra_tolerance is None:
-        ultra_tolerance = max_length
-
-    output_dir = str(input_file.parent.absolute())
-    audio = AudioSegment.from_file(input_file)
-
-    # Detect silent ranges
-    silent_ranges = silence.detect_silence(
-        audio,
-        min_silence_len=600,  # silence longer than 0.6s
-        silence_thresh=audio.dBFS - 16
-    )
-    if audio.duration_seconds < max_length / 1000:
-        print(f"{input_file}无需切割。")
-        return
-
-    if audio.duration_seconds < ultra_tolerance / 1000:
-        print(f"{input_file} 时长：{audio.duration_seconds}，可以容忍。")
-        return
-
-    # Convert to split points
-    split_points = [0]
-    for start, end in silent_ranges:
-        if end - split_points[-1] > max_length:
-            split_points.append(split_points[-1] + max_length)
-        split_points.append(end)
-    split_points.append(len(audio))
-
-    split_points = mergeSplitPoints(split_points, max_length)
-
-    index = 0
-
-    # Export chunks
-    for i in range(len(split_points) - 1):
-        start = split_points[i]
-        end = split_points[i + 1]
-        chunk = audio[start:end]
-
-        # Final safety cut if still too long
-        for sub_i in range(math.ceil(len(chunk) / max_length)):
-            index += 1
-            sub = chunk[sub_i * max_length:(sub_i + 1) * max_length]
-            file = f"{output_dir}/片段{index}.mp3"
-            # 关键：指定高质量参数
-            sub.export(
-                file,
-                format="mp3",
-                bitrate="320k",  # 最高质量
-                parameters=["-q:a", "0"]  # FFmpeg 质量参数：0 最高
-            )
-            print("Saved:", file)
+        logger.exception("Edge TTS 音频生成失败")
+        _emit_progress(progress_callback, f"生成失败: {e}")
+        return False
 

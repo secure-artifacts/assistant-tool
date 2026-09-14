@@ -65,18 +65,27 @@ def generate_srt_whisper_only(audio_path, text, output_srt_path, language="sk",
                                chars_per_line=25, max_lines=2,
                                include_line_breaks=False,
                                max_words_per_block=0,
-                               block_gap_ms=None):
+                               block_gap_ms=None,
+                               model=None):
 
 
 
     text = smart_split_sentences(text)
-    model = stable_whisper.load_faster_whisper("base", device="cpu", compute_type="int8")
+    if model is None:
+        model = stable_whisper.load_faster_whisper(
+            "base", device="cpu", compute_type="int8"
+        )
+        result = model.align(audio_path, text=text, language=language)
+    else:
+        # Reuse the already-loaded faster-whisper instance. Loading a second
+        # CTranslate2 model can terminate Python with 0xC0000005 on Windows.
+        # Calling stable-whisper's align function directly provides the exact
+        # same forced-alignment algorithm without replacing model.transcribe.
+        from stable_whisper.alignment import align as stable_align
 
-    result = model.align(
-        audio_path,
-        text=text,
-        language=language
-    )
+        result = stable_align(
+            model, audio_path, text=text, language=language
+        )
 
     # max_words_per_block 为 0 时保持原来的按字符分块逻辑。
     # 启用单词数控制时先合并，再按单词时间戳均匀分块，避免原始段落边界
